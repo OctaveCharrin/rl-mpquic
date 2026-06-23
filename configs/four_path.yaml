@@ -1,0 +1,53 @@
+# 4-path, no-dominant-path topology — stress test for the learned scheduler.
+# Derived from default.yaml; only the topology (and cap_mbps) differ.
+#
+# Design: no single path saturates VMAF (each ~<=1.8 Mbps usable vs the ~3.3 Mbps
+# quality knee), so aggregation is MANDATORY -> `single` is capped at low VMAF.
+# Aggregate usable ~6 Mbps. Path 2 is a deliberate latency trap (good throughput
+# but 40 ms delay) so a throughput-`proportional` split eats latency, while a
+# learned policy that weighs per-path RTT/queue should down-weight it.
+topology:
+  paths:
+    - {rate: "3Mbps",   delay: "10ms", cross_frac: 0.40}   # clean, low RTT  (~1.8 usable)
+    - {rate: "3Mbps",   delay: "15ms", cross_frac: 0.45}   # clean           (~1.65 usable)
+    - {rate: "2.5Mbps", delay: "40ms", cross_frac: 0.30}   # latency trap    (~1.75 usable, 40ms)
+    - {rate: "2Mbps",   delay: "20ms", cross_frac: 0.55}   # congested       (~0.9 usable)
+
+video:
+  fps: 30
+  min_bitrate_kbps: 300
+  max_bitrate_kbps: 6000
+  init_bitrate_kbps: 1500
+  frame_size_jitter: 0.25
+  keyframe_interval: 30
+
+episode:
+  seconds: 30
+  app_period_s: 1.0
+  warmup_s: 1.0
+
+reward:
+  a_quality: 1.0
+  b_latency: 0.5
+  c_jitter: 0.5
+  d_loss: 1.0
+  latency_norm_ms: 200.0
+  jitter_norm_ms: 50.0
+
+sac:
+  hidden_dim: 256
+  gamma: 0.99
+  tau: 0.005
+  lr: 0.0003
+  batch_size: 256
+  buffer_size: 200000
+  start_steps: 1000
+  update_after: 1000
+  updates_per_step: 1
+  auto_entropy: true
+
+run:
+  episodes: 50
+  seed: 1
+  cap_mbps: 12.0           # normalization cap for throughput observations (raw total ~10.5 Mbps)
+  out_dir: "runs"

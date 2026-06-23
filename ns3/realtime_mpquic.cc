@@ -257,12 +257,15 @@ struct PathLink
 
 struct ScenarioConfig
 {
-    // Asymmetric 3-path access (wired / Wi-Fi / LTE-like) so a fixed split is
-    // suboptimal and a state-aware agent can win.
+    // 4-path no-dominant topology (mirrors configs/four_path.yaml): no single
+    // path saturates VMAF, so aggregation is mandatory and a state-aware split
+    // beats single-best/proportional. Path 2 is a latency trap (good rate,
+    // 40 ms delay).
     std::vector<PathLink> paths = {
-        {"8Mbps", "10ms", 0.45},
-        {"4Mbps", "17ms", 0.65},
-        {"2Mbps", "30ms", 0.35},
+        {"3Mbps", "10ms", 0.40},
+        {"3Mbps", "15ms", 0.45},
+        {"2.5Mbps", "40ms", 0.30},
+        {"2Mbps", "20ms", 0.55},
     };
     double fps = 30.0;
     double episodeSeconds = 30.0;
