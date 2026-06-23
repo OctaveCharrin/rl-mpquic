@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Build artifacts of the ns3-ai pybind module (built in-tree under ns-3-dev)
+*.so
+
+# Training output
+runs/
+checkpoints/
+*.pth
+*.log
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store

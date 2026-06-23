@@ -1,0 +1,69 @@
+# Default configuration for the real-time MPQUIC hierarchical-RL experiment.
+# Loaded by train.py / evaluate.py; every field has a code-side default so a
+# partial config is fine.
+
+# ---------------------------------------------------------------------------
+# Network topology: one entry per path (subflow). Rates/delays are the path's
+# bottleneck; cross_frac is mean UDP cross-traffic as a fraction of the rate.
+# Asymmetric on purpose (wired / Wi-Fi / LTE-like) so splitting is non-trivial.
+# ---------------------------------------------------------------------------
+topology:
+  paths:
+    - {rate: "8Mbps",  delay: "10ms", cross_frac: 0.45}
+    - {rate: "4Mbps",  delay: "17ms", cross_frac: 0.65}
+    - {rate: "2Mbps",  delay: "30ms", cross_frac: 0.35}
+
+# ---------------------------------------------------------------------------
+# Real-time video source (WebRTC-like).
+# ---------------------------------------------------------------------------
+video:
+  fps: 30                  # frames per second (bridge decision cadence)
+  min_bitrate_kbps: 300    # App-agent action range
+  max_bitrate_kbps: 6000
+  init_bitrate_kbps: 1500
+  frame_size_jitter: 0.25  # relative per-frame size variability (I/P burstiness)
+  keyframe_interval: 30    # every Nth frame is a larger I-frame
+
+# ---------------------------------------------------------------------------
+# Episode / decision timing.
+# ---------------------------------------------------------------------------
+episode:
+  seconds: 30              # episode horizon (sim seconds)
+  app_period_s: 1.0        # App agent decision period
+  warmup_s: 1.0            # let subflows establish before first decision
+
+# ---------------------------------------------------------------------------
+# QoE reward weights:  R = a*VMAF - b*latency - c*jitter - d*loss
+# (latency/jitter normalized by *_norm_ms, loss in [0,1]).
+# ---------------------------------------------------------------------------
+reward:
+  a_quality: 1.0
+  b_latency: 0.5
+  c_jitter: 0.5
+  d_loss: 1.0
+  latency_norm_ms: 200.0
+  jitter_norm_ms: 50.0
+
+# ---------------------------------------------------------------------------
+# SAC hyperparameters (shared defaults; both agents).
+# ---------------------------------------------------------------------------
+sac:
+  hidden_dim: 256
+  gamma: 0.99
+  tau: 0.005
+  lr: 0.0003
+  batch_size: 256
+  buffer_size: 200000
+  start_steps: 1000        # uniform-random actions before learning
+  update_after: 1000       # env steps before first gradient update
+  updates_per_step: 1
+  auto_entropy: true
+
+# ---------------------------------------------------------------------------
+# Run / experiment.
+# ---------------------------------------------------------------------------
+run:
+  episodes: 50
+  seed: 1
+  cap_mbps: 10.0           # normalization cap for throughput observations
+  out_dir: "runs"

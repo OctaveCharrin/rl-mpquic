@@ -1,0 +1,33 @@
+[project]
+name = "rl-mpquic"
+version = "0.1.0"
+description = "Dual-agent hierarchical RL for real-time video conferencing over (abstracted) Multipath QUIC in NS-3"
+readme = "README.md"
+# Must be 3.12 to match the ns3-ai pybind11 .so ABI (cpython-312).
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=1.24.0",
+    "torch>=2.0.0",
+    "pyyaml>=6.0",
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.uv]
+package = true
