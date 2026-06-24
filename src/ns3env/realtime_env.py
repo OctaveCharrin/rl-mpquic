@@ -40,8 +40,11 @@ from .video_source import VideoSourceConfig
 _PATH_FEATURES = 5
 # Global feature count prepended to the transport observation.
 _TRANSPORT_GLOBAL = 4
-# App observation feature count.
-_APP_FEATURES = 6
+# App observation feature count. The policy is horizon-agnostic: it sees only
+# sender-observable state, never how far through the episode it is (a real call
+# has unknown duration), and the fixed episode length is handled as a value
+# bootstrap (truncation), not a terminal, in the training loop.
+_APP_FEATURES = 5
 
 # Normalization references (bytes) for cwnd / send-buffer occupancy.
 _CWND_NORM = 200_000.0
@@ -73,6 +76,9 @@ class HierarchicalRealtimeEnv:
         self.dp = dataplane
         self.video = video or VideoSourceConfig()
         self.weights = weights or QoEWeights()
+        # Retained for config compatibility/logging only; no longer fed to the
+        # policy (the App observation is horizon-agnostic). The episode horizon is
+        # enforced by the data plane and handled as a truncation in training.
         self.episode_seconds = float(episode_seconds)
 
         self._obs: Optional[FrameObs] = None
@@ -123,7 +129,9 @@ class HierarchicalRealtimeEnv:
 
     def build_app_obs(self, obs: Optional[FrameObs] = None) -> np.ndarray:
         o = obs or self.obs
-        progress = min(1.0, o.clock_s / max(self.episode_seconds, 1e-6))
+        # No episode-progress feature on purpose: the policy must be deployable on
+        # a call of unknown/unbounded duration, so it sees only sender-observable
+        # state (bitrate it chose + measured RTT/jitter/loss/throughput).
         return np.array(
             [
                 self._bitrate_norm(o.current_bitrate_kbps),
@@ -131,7 +139,6 @@ class HierarchicalRealtimeEnv:
                 _clip(o.jitter_ms / self.weights.jitter_norm_ms),
                 _clip(o.loss),
                 _clip(o.throughput_mbps / self.dp.cap_mbps),
-                progress,
             ],
             dtype=np.float32,
         )

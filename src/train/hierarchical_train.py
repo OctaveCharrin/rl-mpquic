@@ -148,7 +148,10 @@ def _run_episode(
         split, t_raw = transport.select(t_obs)
         next_obs, t_r, done, info = env.step(target_kbps, split)
         t_next_obs = env.build_transport_obs(next_obs, target_kbps)
-        transport.store(t_obs, t_raw, t_r, t_next_obs, done)
+        # The episode horizon is a time-limit *truncation*, not a real terminal
+        # (the call could continue), so always bootstrap off the next state
+        # (done=False) to keep the policy horizon-agnostic.
+        transport.store(t_obs, t_raw, t_r, t_next_obs, False)
         transport.update()
 
         ep_t_r += t_r
@@ -158,11 +161,12 @@ def _run_episode(
         bitrates.append(target_kbps)
         obs = next_obs
 
-    # Credit the final (partial) App window.
+    # Credit the final (partial) App window. The horizon is a truncation, not a
+    # real terminal, so bootstrap off the final observation (done=False).
     if prev_app_obs is not None:
         app_r, comps = env.pop_app_window_reward()
         final_app_obs = env.build_app_obs(obs)
-        app.store(prev_app_obs, prev_app_raw, app_r, final_app_obs, True)
+        app.store(prev_app_obs, prev_app_raw, app_r, final_app_obs, False)
         app.update()
         ep_app_r += app_r
         n_app += 1

@@ -493,7 +493,7 @@ fixed-length numpy vectors normalized to roughly `[0, 1]`.
 
 ### 6.1 Observation construction
 
-**App-agent observation** — `build_app_obs`, dimension **6**:
+**App-agent observation** — `build_app_obs`, dimension **5**:
 
 | Index | Feature | Normalization |
 |---|---|---|
@@ -502,12 +502,17 @@ fixed-length numpy vectors normalized to roughly `[0, 1]`.
 | 2 | aggregate jitter | `jitter_ms / jitter_norm_ms` (50) |
 | 3 | aggregate loss | `loss` (already in [0,1]) |
 | 4 | aggregate throughput | `throughput_mbps / cap_mbps` |
-| 5 | episode progress | `clock_s / episode_seconds` |
 
 The App agent thus sees a compact, *aggregate* summary: how good its current
-quality choice is and what it is costing in delay/jitter/loss, plus where it is in
-the episode. It deliberately does **not** see per-path detail — that is the
-Transport agent's concern.
+quality choice is and what it is costing in delay/jitter/loss. It deliberately
+does **not** see per-path detail — that is the Transport agent's concern — and,
+just as deliberately, it does **not** see episode progress / time-to-go. A real
+video call has unknown, unbounded duration, so a deployable policy must be
+**horizon-agnostic**; conditioning on "how far through the episode we are" would
+both leak information the sender cannot have at deployment and invite
+end-of-episode-specific behavior (e.g. spending latency budget at the very end
+where there is no discounted future to pay for it). The fixed training horizon is
+instead handled as a *time-limit truncation* rather than a terminal state (§8).
 
 **Transport-agent observation** — `build_transport_obs`, dimension **4 + 5·N**
 (= 24 for the canonical N = 4 NS-3 topology; 19 for the legacy 3-path config):
@@ -733,18 +738,24 @@ while not done:
     split, t_raw ← transport.select(t_obs)
     next_obs, r_t, done, info ← env.step(target_kbps, split)
     t_next ← build_transport_obs(next_obs, target_kbps)
-    transport.store(t_obs, t_raw, r_t, t_next, done)
+    transport.store(t_obs, t_raw, r_t, t_next, done=False)   # truncation, not terminal
     transport.update()
     obs ← next_obs
 
-# episode end: credit the final (partial) App window with done=True
+# episode end: credit the final (partial) App window, also with done=False
 ```
 
 Key correctness points: the App transition's *next state* is the app-observation
 at the **next** boundary (a genuine temporally-extended SARSA-style tuple over the
 window), and its reward is the QoE of the window the *previous* action governed.
-The Transport transition is an ordinary per-frame tuple. The final partial window
-is credited at episode end with `done = True`. The loop logs per-episode mean QoE,
+The Transport transition is an ordinary per-frame tuple. **Time-limit handling:**
+the episode horizon is a *truncation*, not a real terminal — the call could
+continue past it — so every transition (including the final partial App window) is
+stored with `done = False`, bootstrapping the value off the next state rather than
+cutting the return. This keeps both policies horizon-agnostic (consistent with the
+App agent not observing episode progress, §6.1) and is the standard finite-horizon
+correction (Pardo et al., *Time Limits in RL*, 2018). The loop logs per-episode
+mean QoE,
 mean transport reward, mean bitrate/latency/loss/VMAF, and at the end writes
 `app.pth`, `transport.pth`, and a `stats.json` history to the run directory. A
 `finally` block guarantees `dp.close()` (hence `ACT_TERMINATE` and shared-memory
@@ -852,7 +863,7 @@ and parameterize `N`, topology, and mobility per episode for domain randomizatio
 
 | Quantity | Value |
 |---|---|
-| App observation dim | 6 |
+| App observation dim | 5 (horizon-agnostic; no episode-progress feature) |
 | App action dim | 1 (→ bitrate ∈ [300, 6000] kbps) |
 | Transport observation dim | 4 + 5N = 24 (19 for the legacy 3-path config) |
 | Transport action dim | N = 4 (→ softmax split) |

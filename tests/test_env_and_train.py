@@ -17,10 +17,10 @@ def test_obs_dimensions():
     env = _env()
     env.reset(seed=2)
     n = env.num_paths
-    assert env.app_obs_dim == 6
+    assert env.app_obs_dim == 5
     assert env.transport_obs_dim == 4 + 5 * n
     assert env.transport_act_dim == n
-    assert env.build_app_obs().shape == (6,)
+    assert env.build_app_obs().shape == (5,)
     assert env.build_transport_obs().shape == (4 + 5 * n,)
 
 
