@@ -73,13 +73,17 @@ class ExperimentConfig:
         base_rtt = [2.0 * parse_delay_ms(p["delay"]) for p in self.paths]
         cross = [float(p.get("cross_frac", 0.4)) for p in self.paths]
         n = len(self.paths)
+        # Per-path seasonality periods, cycled so any path count is covered
+        # (truncating to [:n] under-fills when n exceeds the base list length).
+        seasons = [12.0, 7.0, 20.0]
+        cross_periods = [5.0, 3.0, 8.0]
         cfg = MockRealtimeConfig(
             base_mbps=base_mbps,
             base_rtt_ms=base_rtt,
             amp=[0.45 + 0.1 * (i % 3) for i in range(n)],
-            period_s=[12.0, 7.0, 20.0][:n] or [12.0] * n,
+            period_s=[seasons[i % len(seasons)] for i in range(n)],
             cross_frac=cross,
-            cross_period_s=[5.0, 3.0, 8.0][:n] or [5.0] * n,
+            cross_period_s=[cross_periods[i % len(cross_periods)] for i in range(n)],
             fps=self.fps,
             episode_seconds=self.episode_seconds,
             app_period_s=self.app_period_s,
