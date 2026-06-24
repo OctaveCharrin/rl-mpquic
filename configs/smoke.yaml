@@ -1,9 +1,12 @@
 # Tiny config for a fast end-to-end smoke test of the NS-3 bridge.
+# Topology mirrors the canonical 4-path no-dominant scenario (configs/four_path.yaml
+# / the hardcoded C++ ScenarioConfig) so a smoke run matches production shape.
 topology:
   paths:
-    - {rate: "8Mbps", delay: "10ms", cross_frac: 0.45}
-    - {rate: "4Mbps", delay: "17ms", cross_frac: 0.65}
-    - {rate: "2Mbps", delay: "30ms", cross_frac: 0.35}
+    - {rate: "3Mbps",   delay: "10ms", cross_frac: 0.40}
+    - {rate: "3Mbps",   delay: "15ms", cross_frac: 0.45}
+    - {rate: "2.5Mbps", delay: "40ms", cross_frac: 0.30}
+    - {rate: "2Mbps",   delay: "20ms", cross_frac: 0.55}
 video:
   fps: 30
   min_bitrate_kbps: 300
@@ -25,3 +28,4 @@ sac:
 run:
   episodes: 2
   seed: 1
+  cap_mbps: 12.0           # match the 4-path topology's throughput normalization
