@@ -8,6 +8,7 @@ controller can be compared to simple heuristics:
 * ``even``        — split every frame equally across paths.
 * ``single``      — send the whole frame on the highest-throughput path.
 * ``proportional``— split in proportion to recent per-path throughput.
+* ``random``      — a fresh uniform-over-simplex split every frame (seeded).
 * ``learned``     — the trained App + Transport agents, acting deterministically.
 
 Baselines use a reactive bitrate heuristic (90% of recent aggregate goodput) so
@@ -54,6 +55,17 @@ def _proportional(obs: FrameObs, target: float) -> np.ndarray:
     thr = np.asarray(obs.path_throughput_mbps, dtype=np.float64)
     thr = np.clip(thr, 1e-6, None)
     return (thr / thr.sum()).astype(np.float32)
+
+
+def _random_split(seed: int) -> SplitFn:
+    """A non-reactive baseline: draw a fresh split uniformly over the simplex
+    each frame. Seeded so the evaluation stays reproducible."""
+    rng = np.random.default_rng(seed)
+
+    def fn(obs: FrameObs, target: float) -> np.ndarray:
+        return rng.dirichlet(np.ones(obs.num_paths)).astype(np.float32)
+
+    return fn
 
 
 def _rollout(
@@ -144,6 +156,7 @@ def run_evaluation(
         "even": (bitrate_heur, _even_split),
         "single": (bitrate_heur, _single_best),
         "proportional": (bitrate_heur, _proportional),
+        "random": (bitrate_heur, _random_split(seed)),
     }
     if app_ckpt and transport_ckpt:
         policies["learned"] = _learned_policies(env, app_ckpt, transport_ckpt, cfg)
