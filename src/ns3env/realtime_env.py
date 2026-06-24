@@ -30,6 +30,7 @@ import numpy as np
 from .dataplane import DataPlane, FrameObs, FrameResult
 from .qoe import (
     QoEWeights,
+    VmafFn,
     compute_qoe_reward,
     compute_transport_reward,
     qoe_components,
@@ -72,10 +73,13 @@ class HierarchicalRealtimeEnv:
         video: Optional[VideoSourceConfig] = None,
         weights: Optional[QoEWeights] = None,
         episode_seconds: float = 30.0,
+        vmaf_fn: Optional[VmafFn] = None,
     ):
         self.dp = dataplane
         self.video = video or VideoSourceConfig()
         self.weights = weights or QoEWeights()
+        # Optional learned VMAF scorer; None => default bitrate-only log curve.
+        self.vmaf_fn = vmaf_fn
         # Retained for config compatibility/logging only; no longer fed to the
         # policy (the App observation is horizon-agnostic). The episode horizon is
         # enforced by the data plane and handled as a truncation in training.
@@ -207,7 +211,11 @@ class HierarchicalRealtimeEnv:
         """
         if not self._win_latency:
             comps = qoe_components(
-                bitrate_kbps=self._win_bitrate, latency_ms=0.0, jitter_ms=0.0, loss=0.0
+                bitrate_kbps=self._win_bitrate,
+                latency_ms=0.0,
+                jitter_ms=0.0,
+                loss=0.0,
+                vmaf_fn=self.vmaf_fn,
             )
             return 0.0, comps
         lat = float(np.mean(self._win_latency))
@@ -219,9 +227,14 @@ class HierarchicalRealtimeEnv:
             jitter_ms=jit,
             loss=los,
             weights=self.weights,
+            vmaf_fn=self.vmaf_fn,
         )
         comps = qoe_components(
-            bitrate_kbps=self._win_bitrate, latency_ms=lat, jitter_ms=jit, loss=los
+            bitrate_kbps=self._win_bitrate,
+            latency_ms=lat,
+            jitter_ms=jit,
+            loss=los,
+            vmaf_fn=self.vmaf_fn,
         )
         self._win_latency.clear()
         self._win_jitter.clear()

@@ -33,6 +33,10 @@ reward:
   d_loss: 1.0
   latency_norm_ms: 200.0
   jitter_norm_ms: 50.0
+  # Set true (or pass --learned-vmaf) to score quality with the WebRTC-grounded
+  # learned QoS->VMAF surrogate instead of the bitrate-only log curve.
+  # use_learned_vmaf: false
+  # learned_vmaf_model: null   # optional explicit path to reward_model.npz
 
 sac:
   hidden_dim: 256

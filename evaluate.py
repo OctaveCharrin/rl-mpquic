@@ -24,6 +24,11 @@ def main() -> None:
     p.add_argument("--app", default=None, help="App agent checkpoint (app.pth)")
     p.add_argument("--transport", default=None, help="Transport agent checkpoint (transport.pth)")
     p.add_argument("--show-output", action="store_true", help="stream NS-3 stdout/stderr")
+    p.add_argument(
+        "--learned-vmaf",
+        action="store_true",
+        help="score QoE with the learned QoS->VMAF surrogate (match how you trained)",
+    )
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -35,6 +40,7 @@ def main() -> None:
         app_ckpt=args.app,
         transport_ckpt=args.transport,
         show_output=args.show_output,
+        use_learned_vmaf=args.learned_vmaf or None,
     )
 
 

@@ -51,6 +51,7 @@ def run_training(
     out_dir: Optional[str] = None,
     seed: Optional[int] = None,
     log_every: int = 1,
+    use_learned_vmaf: Optional[bool] = None,
 ) -> Dict[str, object]:
     """Train both agents; return a stats dict (also written to disk)."""
     episodes = int(episodes if episodes is not None else cfg.episodes)
@@ -61,9 +62,19 @@ def run_training(
     torch.manual_seed(base_seed)
     np.random.seed(base_seed)
 
+    if use_learned_vmaf is not None:
+        cfg.use_learned_vmaf = bool(use_learned_vmaf)
+    vmaf_fn = cfg.build_vmaf_fn()
+    if cfg.use_learned_vmaf:
+        print("App reward: using learned WebRTC QoS->VMAF surrogate", flush=True)
+
     dp = cfg.make_dataplane(backend, seed=base_seed, show_output=show_output)
     env = HierarchicalRealtimeEnv(
-        dp, video=cfg.video, weights=cfg.weights, episode_seconds=cfg.episode_seconds
+        dp,
+        video=cfg.video,
+        weights=cfg.weights,
+        episode_seconds=cfg.episode_seconds,
+        vmaf_fn=vmaf_fn,
     )
     # First reset establishes num_paths (needed to size the transport agent).
     env.reset(seed=base_seed)
@@ -193,5 +204,6 @@ def _config_summary(cfg: ExperimentConfig) -> Dict[str, object]:
         "deadline_ms": cfg.deadline_ms,
         "bitrate_kbps": [cfg.video.min_bitrate_kbps, cfg.video.max_bitrate_kbps],
         "reward_weights": cfg.weights.to_dict(),
+        "use_learned_vmaf": cfg.use_learned_vmaf,
         "paths": cfg.paths,
     }

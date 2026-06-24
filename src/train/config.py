@@ -22,7 +22,7 @@ from ..ns3env.dataplane import (
     Ns3Config,
     Ns3DataPlane,
 )
-from ..ns3env.qoe import QoEWeights
+from ..ns3env.qoe import QoEWeights, VmafFn
 from ..ns3env.video_source import VideoSourceConfig
 from ..rl.sac_agent import SACConfig
 
@@ -65,6 +65,20 @@ class ExperimentConfig:
     seed: int = 1
     cap_mbps: float = 10.0
     out_dir: str = "runs"
+    # Use the WebRTC-grounded learned QoS->VMAF surrogate for the App reward's
+    # quality term instead of the default bitrate-only log curve.
+    use_learned_vmaf: bool = False
+    learned_vmaf_model: Optional[str] = None  # optional explicit model path
+
+    # -- derived objects ---------------------------------------------------- #
+
+    def build_vmaf_fn(self) -> Optional[VmafFn]:
+        """Learned VMAF scorer if enabled, else None (default log curve)."""
+        if not self.use_learned_vmaf:
+            return None
+        from ..ns3env.learned_vmaf import load_learned_vmaf_fn
+
+        return load_learned_vmaf_fn(self.learned_vmaf_model)
 
     # -- derived backends --------------------------------------------------- #
 
@@ -142,7 +156,11 @@ def load_config(path: Optional[str] = None) -> ExperimentConfig:
     )
     cfg.fps = cfg.video.fps
 
-    cfg.weights = QoEWeights.from_mapping(data.get("reward", {}))
+    reward = data.get("reward", {})
+    cfg.weights = QoEWeights.from_mapping(reward)
+    cfg.use_learned_vmaf = bool(reward.get("use_learned_vmaf", False))
+    model_path = reward.get("learned_vmaf_model")
+    cfg.learned_vmaf_model = str(model_path) if model_path else None
 
     ep = data.get("episode", {})
     cfg.episode_seconds = float(ep.get("seconds", 30.0))

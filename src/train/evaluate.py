@@ -143,11 +143,18 @@ def run_evaluation(
     app_ckpt: Optional[str] = None,
     transport_ckpt: Optional[str] = None,
     show_output: bool = False,
+    use_learned_vmaf: Optional[bool] = None,
 ) -> Dict[str, Dict[str, float]]:
     """Evaluate baselines (+ learned policy if checkpoints given). Prints a table."""
+    if use_learned_vmaf is not None:
+        cfg.use_learned_vmaf = bool(use_learned_vmaf)
     dp = cfg.make_dataplane(backend, seed=seed, show_output=show_output)
     env = HierarchicalRealtimeEnv(
-        dp, video=cfg.video, weights=cfg.weights, episode_seconds=cfg.episode_seconds
+        dp,
+        video=cfg.video,
+        weights=cfg.weights,
+        episode_seconds=cfg.episode_seconds,
+        vmaf_fn=cfg.build_vmaf_fn(),
     )
     env.reset(seed=seed)
 

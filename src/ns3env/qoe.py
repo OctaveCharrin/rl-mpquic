@@ -13,8 +13,13 @@ loss (here, frames that miss their playout deadline):
     QoE = a*VMAF(bitrate) - b*latency - c*jitter - d*loss              (App agent)
 
 with latency/jitter normalized to [0, ~1] by configurable scales and loss in
-[0, 1]. The Transport agent, which only moves bytes across paths (it does not set
-the bitrate), is rewarded for *delivering* frames cheaply:
+[0, 1]. The VMAF term is pluggable (``compute_qoe_reward(..., vmaf_fn=…)``): with
+a *learned* QoS->VMAF model that already folds loss into the quality score, the
+explicit ``- d*loss`` term is dropped to avoid double-counting, leaving
+``a*VMAF(bitrate, loss, …) - b*latency - c*jitter`` (see ``compute_qoe_reward``).
+
+The Transport agent, which only moves bytes across paths (it does not set the
+bitrate), is rewarded for *delivering* frames cheaply:
 
     R_transport = (1 - loss) - b*latency - c*jitter                    (Transport)
 
@@ -25,16 +30,44 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 __all__ = [
     "VMAF_MAX",
     "vmaf_for_kbps",
+    "VmafFn",
     "QoEWeights",
     "compute_qoe_reward",
     "compute_transport_reward",
     "qoe_components",
 ]
+
+# A pluggable VMAF scorer. The default maps bitrate alone via the log curve
+# (``vmaf_for_kbps``); a learned model (see ``learned_vmaf.load_learned_vmaf_fn``)
+# additionally consumes the live latency/jitter/loss. Keyword-only so callers can
+# pass exactly the signals a given model needs; returns VMAF in [0, 100].
+VmafFn = Callable[..., float]
+
+
+def _score_vmaf(
+    vmaf_fn: Optional[VmafFn],
+    *,
+    bitrate_kbps: float,
+    latency_ms: float,
+    jitter_ms: float,
+    loss: float,
+) -> float:
+    """VMAF via the supplied scorer, or the default bitrate-only log curve."""
+    if vmaf_fn is None:
+        return vmaf_for_kbps(bitrate_kbps)
+    return float(
+        vmaf_fn(
+            bitrate_kbps=bitrate_kbps,
+            latency_ms=latency_ms,
+            jitter_ms=jitter_ms,
+            loss=loss,
+        )
+    )
 
 VMAF_MAX: float = 100.0
 # (bitrate_kbps, VMAF) anchors defining the log rate-quality curve. A documented
@@ -107,19 +140,47 @@ def compute_qoe_reward(
     jitter_ms: float,
     loss: float,
     weights: Optional[QoEWeights] = None,
+    vmaf_fn: Optional[VmafFn] = None,
 ) -> float:
-    """App-agent QoE reward: ``a*VMAF - b*latency - c*jitter - d*loss``.
+    """App-agent QoE reward.
 
-    Quality is ``VMAF(bitrate)/100`` in ``[0, 1]``; latency/jitter are normalized
-    by the weight's ``*_norm_ms`` (then soft-capped at 2x to bound the penalty);
-    ``loss`` is a fraction in ``[0, 1]``. Result is clipped to ``[-2, 1]``.
+    Default (log-curve) form::
+
+        a*VMAF(bitrate) - b*latency - c*jitter - d*loss
+
+    Quality is ``VMAF/100`` in ``[0, 1]``; latency/jitter are normalized by the
+    weight's ``*_norm_ms`` (then soft-capped at 2x to bound the penalty); ``loss``
+    is a fraction in ``[0, 1]``. Result is clipped to ``[-2, 1]``.
+
+    ``vmaf_fn`` selects the quality model:
+
+    * **None (default)** — the bitrate-only log curve ``vmaf_for_kbps``; the full
+      ``- d*loss`` penalty applies, since this VMAF ignores loss.
+    * **Learned scorer** — a QoS->VMAF model that *already folds loss into the
+      quality score*. The explicit ``- d*loss`` penalty is therefore **dropped**
+      to avoid double-counting loss; the reward becomes::
+
+          a*VMAF(bitrate, loss, …) - b*latency - c*jitter
+
+      The latency/jitter penalties are intentionally kept: the current learned
+      model does not separate those out (its delay/jitter grid axes are
+      degenerate), so they must remain priced explicitly.
     """
     w = weights or QoEWeights()
-    q = vmaf_for_kbps(bitrate_kbps) / VMAF_MAX
+    q = _score_vmaf(
+        vmaf_fn,
+        bitrate_kbps=bitrate_kbps,
+        latency_ms=latency_ms,
+        jitter_ms=jitter_ms,
+        loss=loss,
+    ) / VMAF_MAX
     lat = min(2.0, max(0.0, latency_ms) / max(w.latency_norm_ms, 1e-6))
     jit = min(2.0, max(0.0, jitter_ms) / max(w.jitter_norm_ms, 1e-6))
+    # A learned VMAF already reflects loss, so its explicit penalty is dropped
+    # (double-count); the default bitrate-only curve does not, so it is kept.
     los = min(1.0, max(0.0, loss))
-    r = w.a_quality * q - w.b_latency * lat - w.c_jitter * jit - w.d_loss * los
+    loss_penalty = 0.0 if vmaf_fn is not None else w.d_loss * los
+    r = w.a_quality * q - w.b_latency * lat - w.c_jitter * jit - loss_penalty
     return float(max(-2.0, min(1.0, r)))
 
 
@@ -151,10 +212,21 @@ def qoe_components(
     latency_ms: float,
     jitter_ms: float,
     loss: float,
+    vmaf_fn: Optional[VmafFn] = None,
 ) -> Dict[str, float]:
-    """Unweighted QoE terms for logging/inspection."""
+    """Unweighted QoE terms for logging/inspection.
+
+    The logged ``vmaf`` uses the same scorer (``vmaf_fn``) as the reward so logs
+    match the objective being optimized.
+    """
     return {
-        "vmaf": vmaf_for_kbps(bitrate_kbps),
+        "vmaf": _score_vmaf(
+            vmaf_fn,
+            bitrate_kbps=bitrate_kbps,
+            latency_ms=latency_ms,
+            jitter_ms=jitter_ms,
+            loss=loss,
+        ),
         "latency_ms": float(latency_ms),
         "jitter_ms": float(jitter_ms),
         "loss": float(loss),
