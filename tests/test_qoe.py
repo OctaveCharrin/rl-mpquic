@@ -2,10 +2,12 @@
 
 import pytest
 
+from src.ns3env.learned_vmaf import load_learned_vmaf_fn
 from src.ns3env.qoe import (
     QoEWeights,
     compute_qoe_reward,
     compute_transport_reward,
+    qoe_components,
     vmaf_for_kbps,
 )
 
@@ -48,3 +50,57 @@ def test_transport_reward_excludes_quality_but_punishes_loss():
     lossy = compute_transport_reward(latency_ms=20, jitter_ms=2, loss=1.0, weights=w)
     assert clean > lossy
     assert -2.0 <= lossy <= 1.0
+
+
+def test_learned_vmaf_fn_loads_and_is_bounded_and_monotonic():
+    vmaf_fn = load_learned_vmaf_fn()
+    scores = [
+        vmaf_fn(bitrate_kbps=r, latency_ms=15, jitter_ms=5, loss=0.0)
+        for r in (200, 500, 1000, 1800, 2400)
+    ]
+    assert all(0.0 <= s <= 100.0 for s in scores)
+    assert all(a <= b + 1e-6 for a, b in zip(scores, scores[1:]))  # non-decreasing in bitrate
+    # More loss should not improve quality at fixed bitrate.
+    clean = vmaf_fn(bitrate_kbps=1500, latency_ms=15, jitter_ms=5, loss=0.0)
+    lossy = vmaf_fn(bitrate_kbps=1500, latency_ms=15, jitter_ms=5, loss=0.08)
+    assert lossy <= clean + 1e-6
+
+
+def test_qoe_reward_uses_pluggable_vmaf_fn():
+    w = QoEWeights()
+    vmaf_fn = load_learned_vmaf_fn()
+    # The reward and the logged component both reflect the supplied scorer.
+    r_default = compute_qoe_reward(bitrate_kbps=1500, latency_ms=20, jitter_ms=5, loss=0.0, weights=w)
+    r_learned = compute_qoe_reward(
+        bitrate_kbps=1500, latency_ms=20, jitter_ms=5, loss=0.0, weights=w, vmaf_fn=vmaf_fn
+    )
+    assert -2.0 <= r_learned <= 1.0
+    comps = qoe_components(bitrate_kbps=1500, latency_ms=20, jitter_ms=5, loss=0.0, vmaf_fn=vmaf_fn)
+    assert comps["vmaf"] == pytest.approx(
+        vmaf_fn(bitrate_kbps=1500, latency_ms=20, jitter_ms=5, loss=0.0)
+    )
+    # Default path is unchanged (still the log curve).
+    assert r_default == pytest.approx(
+        compute_qoe_reward(bitrate_kbps=1500, latency_ms=20, jitter_ms=5, loss=0.0, weights=w)
+    )
+
+
+def test_learned_reward_drops_explicit_loss_penalty():
+    w = QoEWeights()
+    # A scorer whose VMAF ignores loss isolates the *explicit* loss penalty.
+    const_vmaf = lambda **kw: 80.0  # noqa: E731
+
+    # Default (log-curve) reward: loss is penalized explicitly.
+    d_clean = compute_qoe_reward(bitrate_kbps=1500, latency_ms=20, jitter_ms=5, loss=0.0, weights=w)
+    d_lossy = compute_qoe_reward(bitrate_kbps=1500, latency_ms=20, jitter_ms=5, loss=0.5, weights=w)
+    assert d_clean > d_lossy  # default path keeps -d*loss
+
+    # Learned path: explicit loss penalty dropped, so a loss-blind VMAF makes the
+    # reward invariant to loss (latency/jitter penalties still apply, unchanged).
+    l_clean = compute_qoe_reward(
+        bitrate_kbps=1500, latency_ms=20, jitter_ms=5, loss=0.0, weights=w, vmaf_fn=const_vmaf
+    )
+    l_lossy = compute_qoe_reward(
+        bitrate_kbps=1500, latency_ms=20, jitter_ms=5, loss=0.5, weights=w, vmaf_fn=const_vmaf
+    )
+    assert l_clean == pytest.approx(l_lossy)

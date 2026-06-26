@@ -493,7 +493,7 @@ fixed-length numpy vectors normalized to roughly `[0, 1]`.
 
 ### 6.1 Observation construction
 
-**App-agent observation** — `build_app_obs`, dimension **6**:
+**App-agent observation** — `build_app_obs`, dimension **5**:
 
 | Index | Feature | Normalization |
 |---|---|---|
@@ -502,12 +502,17 @@ fixed-length numpy vectors normalized to roughly `[0, 1]`.
 | 2 | aggregate jitter | `jitter_ms / jitter_norm_ms` (50) |
 | 3 | aggregate loss | `loss` (already in [0,1]) |
 | 4 | aggregate throughput | `throughput_mbps / cap_mbps` |
-| 5 | episode progress | `clock_s / episode_seconds` |
 
 The App agent thus sees a compact, *aggregate* summary: how good its current
-quality choice is and what it is costing in delay/jitter/loss, plus where it is in
-the episode. It deliberately does **not** see per-path detail — that is the
-Transport agent's concern.
+quality choice is and what it is costing in delay/jitter/loss. It deliberately
+does **not** see per-path detail — that is the Transport agent's concern — and,
+just as deliberately, it does **not** see episode progress / time-to-go. A real
+video call has unknown, unbounded duration, so a deployable policy must be
+**horizon-agnostic**; conditioning on "how far through the episode we are" would
+both leak information the sender cannot have at deployment and invite
+end-of-episode-specific behavior (e.g. spending latency budget at the very end
+where there is no discounted future to pay for it). The fixed training horizon is
+instead handled as a *time-limit truncation* rather than a terminal state (§8).
 
 **Transport-agent observation** — `build_transport_obs`, dimension **4 + 5·N**
 (= 24 for the canonical N = 4 NS-3 topology; 19 for the legacy 3-path config):
@@ -552,7 +557,44 @@ VMAF(R) = a · ln(R) + b ,   clipped to [0, 100],
    with a, b solving the two anchors.
 ```
 
-**App QoE reward** (`compute_qoe_reward`), credited per window:
+*Pluggable quality model (learned VMAF).* The VMAF term is a swappable hook
+(`compute_qoe_reward(..., vmaf_fn=…)`). Passing `--learned-vmaf` (or
+`reward.use_learned_vmaf: true` in the config) replaces the bitrate-only log curve
+with a **WebRTC-grounded learned surrogate** vendored from the
+`WebRTC-QoE-Data-Generator` sibling project (`src/ns3env/qos_vmaf_reward.py` +
+`reward_model.npz`, wrapped by `src/ns3env/learned_vmaf.py`). That model is a
+multilinear interpolant over *real* WebRTC VMAF measurements mapping
+`(bitrate_kbps, loss_pct, delay_ms, jitter_ms) → VMAF`, clamped to its measured
+grid box.
+
+Because the learned VMAF **already folds loss into the quality score**, the
+explicit `− d·loss` penalty is **dropped** under the learned reward to avoid
+double-counting; the latency/jitter penalties are **kept** (the current model does
+not separate those — see the grid caveat below). Concretely, the App reward is
+selected by which quality model is active:
+
+```
+default (log curve):  QoE = a·VMAF(bitrate)/100 − b·lat − c·jit − d·loss
+learned surrogate:    QoE = a·VMAF(bitrate, loss, delay, jitter)/100 − b·lat − c·jit
+                            (no explicit − d·loss term; loss enters via VMAF)
+```
+
+with `lat`, `jit` the same normalized, soft-capped penalties in both cases, and
+the result clipped to `[−2, 1]`. The unit translation at the boundary
+(`learned_vmaf.py`) is: loss fraction → percent (`×100`), one-way frame
+`latency_ms` → the model's one-way `delay_ms` (no `/2`), jitter passes through.
+
+Two caveats follow from how the shipped grid was fitted: (i) its bitrate axis
+saturates near ~2500 kbps, so the App agent gets no quality incentive to push
+above that under the learned reward (a reasonable conferencing ceiling); and
+(ii) the model's delay/jitter axes are currently **degenerate** (a single measured
+point), so the shipped surrogate varies over bitrate and loss only — which is
+exactly why the latency/jitter penalties must stay explicit. A richer refit
+activates the delay/jitter axes with no code change (the adapter already passes
+them). The default (log curve) path is byte-for-byte unchanged.
+
+**App QoE reward** (`compute_qoe_reward`, default log-curve form),
+credited per window:
 
 ```
 QoE = a · VMAF(bitrate)/100
@@ -733,18 +775,24 @@ while not done:
     split, t_raw ← transport.select(t_obs)
     next_obs, r_t, done, info ← env.step(target_kbps, split)
     t_next ← build_transport_obs(next_obs, target_kbps)
-    transport.store(t_obs, t_raw, r_t, t_next, done)
+    transport.store(t_obs, t_raw, r_t, t_next, done=False)   # truncation, not terminal
     transport.update()
     obs ← next_obs
 
-# episode end: credit the final (partial) App window with done=True
+# episode end: credit the final (partial) App window, also with done=False
 ```
 
 Key correctness points: the App transition's *next state* is the app-observation
 at the **next** boundary (a genuine temporally-extended SARSA-style tuple over the
 window), and its reward is the QoE of the window the *previous* action governed.
-The Transport transition is an ordinary per-frame tuple. The final partial window
-is credited at episode end with `done = True`. The loop logs per-episode mean QoE,
+The Transport transition is an ordinary per-frame tuple. **Time-limit handling:**
+the episode horizon is a *truncation*, not a real terminal — the call could
+continue past it — so every transition (including the final partial App window) is
+stored with `done = False`, bootstrapping the value off the next state rather than
+cutting the return. This keeps both policies horizon-agnostic (consistent with the
+App agent not observing episode progress, §6.1) and is the standard finite-horizon
+correction (Pardo et al., *Time Limits in RL*, 2018). The loop logs per-episode
+mean QoE,
 mean transport reward, mean bitrate/latency/loss/VMAF, and at the end writes
 `app.pth`, `transport.pth`, and a `stats.json` history to the run directory. A
 `finally` block guarantees `dp.close()` (hence `ACT_TERMINATE` and shared-memory
@@ -825,8 +873,11 @@ deliberate, and arguably correct, real-time framing, but not identical to an
 unreliable-datagram transport. (iii) *Reordering across paths:* the byte-watermark
 tracker measures per-path completion and aggregates to a frame; it does not model
 application-layer resequencing cost beyond the max-arrival latency. (iv)
-*Single client/server, static `N` per run.* (v) *VMAF curve* is a documented
-log-anchor stand-in, not measured per-content quality.
+*Single client/server, static `N` per run.* (v) *Quality model:* the default VMAF
+is a documented log-anchor stand-in, not measured per-content quality; the
+optional `--learned-vmaf` surrogate (§6.3) is grounded in real WebRTC VMAF
+measurements but is still a fixed, content-agnostic grid (bitrate axis saturating
+~2500 kbps; delay/jitter axes degenerate until refit).
 
 **Notable engineering choices.** The byte-watermark scheme yields per-frame
 latency over pipelined reliable streams without per-packet tagging. `FlowMonitor`
@@ -841,8 +892,10 @@ final results.
 **Natural extensions.** Swap TCP for the `signetlabdei/quic` NS-3 module behind
 the same `RealtimeSource`/`RealtimeStruct` interface; add FEC/retransmission and a
 true unreliable-datagram loss model; condition the App agent on per-path summaries
-or recurrent state; replace the VMAF stand-in with a measured rate-quality table;
-and parameterize `N`, topology, and mobility per episode for domain randomization.
+or recurrent state; refit the learned VMAF surrogate over a denser
+bitrate/loss/delay/jitter grid (or per-content rate-quality tables) to activate
+its currently-degenerate delay/jitter axes; and parameterize `N`, topology, and
+mobility per episode for domain randomization.
 
 ---
 
@@ -852,7 +905,7 @@ and parameterize `N`, topology, and mobility per episode for domain randomizatio
 
 | Quantity | Value |
 |---|---|
-| App observation dim | 6 |
+| App observation dim | 5 (horizon-agnostic; no episode-progress feature) |
 | App action dim | 1 (→ bitrate ∈ [300, 6000] kbps) |
 | Transport observation dim | 4 + 5N = 24 (19 for the legacy 3-path config) |
 | Transport action dim | N = 4 (→ softmax split) |
@@ -867,7 +920,9 @@ and parameterize `N`, topology, and mobility per episode for domain randomizatio
 | bitrate range / init | 300–6000 / 1500 kbps | `video` |
 | reward weights `a,b,c,d` | 1.0, 0.5, 0.5, 1.0 | `reward` |
 | latency / jitter normalizers | 200 / 50 ms | `QoEWeights` |
-| VMAF anchors | (300, 25), (4300, 92) | `qoe.py` |
+| VMAF anchors (default log curve) | (300, 25), (4300, 92) | `qoe.py` |
+| learned VMAF | off by default; `--learned-vmaf` / `reward.use_learned_vmaf` | `learned_vmaf.py`, `reward_model.npz` |
+| learned VMAF grid box | bitrate ≤ ~2500 kbps, loss 0–10 %, delay/jitter degenerate | `reward_model.npz` |
 | SAC hidden / γ / τ / lr | 256 / 0.99 / 0.005 / 3e-4 | `SACConfig` |
 | batch / buffer / start_steps / update_after | 256 / 200k / 1000 / 1000 | `SACConfig` |
 | cwnd / buffer obs normalizers | 200 000 B | `realtime_env.py` |
@@ -886,7 +941,9 @@ and parameterize `N`, topology, and mobility per episode for domain randomizatio
 | `ns3/CMakeLists.txt`, `scripts/install_ns3_example.sh` | build + install into ns-3-dev |
 | `src/ns3env/dataplane.py` | `DataPlane` ABC, `MockRealtimeDataPlane`, `Ns3DataPlane`, `FrameObs`/`FrameResult` |
 | `src/ns3env/video_source.py` | frame-size model (mirrors C++) |
-| `src/ns3env/qoe.py` | VMAF curve, App QoE reward, transport reward |
+| `src/ns3env/qoe.py` | VMAF curve, App QoE reward (pluggable `vmaf_fn`), transport reward |
+| `src/ns3env/qos_vmaf_reward.py` + `reward_model.npz` | vendored learned QoS→VMAF surrogate (from `WebRTC-QoE-Data-Generator`) |
+| `src/ns3env/learned_vmaf.py` | adapter: learned surrogate → `vmaf_fn` (unit translation) |
 | `src/ns3env/realtime_env.py` | observation builders, reward windows |
 | `src/rl/sac_agent.py` | generic SAC (actor, twin critics, targets, entropy tuning) |
 | `src/rl/replay_buffer.py` | circular replay buffer |

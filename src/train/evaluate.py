@@ -12,7 +12,7 @@ method:
 * one representative per-frame time-series trace (for time-series/split plots).
 
 Everything is dumped to ``<out_dir>/evaluation_results.json``, which
-``evaluation/06_generate_figures.py`` turns into figures. The data plane is
+``evaluation/generate_figures.py`` turns into figures. The data plane is
 backend-agnostic (mock or NS-3); the learned policy is only included when both
 checkpoints are supplied, otherwise the report is baselines-only.
 
@@ -21,6 +21,7 @@ Baselines:
 * ``even``        — split every frame equally across paths.
 * ``single``      — send the whole frame on the highest-throughput path.
 * ``proportional``— split in proportion to recent per-path throughput.
+* ``random``      — a fresh uniform-over-simplex split every frame (seeded).
 * ``learned``     — the trained App + Transport agents, acting deterministically.
 
 Baselines use a reactive bitrate heuristic (90% of recent aggregate goodput) so
@@ -85,6 +86,17 @@ def _timed(fn, *args):
     t0 = time.perf_counter()
     out = fn(*args)
     return out, (time.perf_counter() - t0) * 1000.0
+
+
+def _random_split(seed: int) -> SplitFn:
+    """A non-reactive baseline: draw a fresh split uniformly over the simplex
+    each frame. Seeded so the evaluation stays reproducible."""
+    rng = np.random.default_rng(seed)
+
+    def fn(obs: FrameObs, target: float) -> np.ndarray:
+        return rng.dirichlet(np.ones(obs.num_paths)).astype(np.float32)
+
+    return fn
 
 
 def _rollout(
@@ -224,16 +236,26 @@ def run_evaluation(
     show_output: bool = False,
     out_dir: Optional[str] = None,
     save_json: bool = True,
+    use_learned_vmaf: Optional[bool] = None,
 ) -> Dict[str, object]:
     """Evaluate baselines (+ learned policy if checkpoints given).
 
     Returns the full results dict (also written to
     ``<out_dir>/evaluation_results.json`` when ``save_json``), with keys
     ``meta`` / ``summary`` / ``distributions`` / ``traces``. Prints a table.
+
+    ``use_learned_vmaf`` (when not None) overrides ``cfg.use_learned_vmaf`` so
+    QoE is scored with the learned QoS->VMAF surrogate, matching how you trained.
     """
+    if use_learned_vmaf is not None:
+        cfg.use_learned_vmaf = bool(use_learned_vmaf)
     dp = cfg.make_dataplane(backend, seed=seed, show_output=show_output)
     env = HierarchicalRealtimeEnv(
-        dp, video=cfg.video, weights=cfg.weights, episode_seconds=cfg.episode_seconds
+        dp,
+        video=cfg.video,
+        weights=cfg.weights,
+        episode_seconds=cfg.episode_seconds,
+        vmaf_fn=cfg.build_vmaf_fn(),
     )
     env.reset(seed=seed)
 
@@ -242,6 +264,7 @@ def run_evaluation(
         "even": (bitrate_heur, _even_split),
         "single": (bitrate_heur, _single_best),
         "proportional": (bitrate_heur, _proportional),
+        "random": (bitrate_heur, _random_split(seed)),
     }
     if app_ckpt and transport_ckpt:
         policies["learned"] = _learned_policies(env, app_ckpt, transport_ckpt, cfg)

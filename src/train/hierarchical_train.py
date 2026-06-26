@@ -51,6 +51,7 @@ def run_training(
     out_dir: Optional[str] = None,
     seed: Optional[int] = None,
     log_every: int = 1,
+    use_learned_vmaf: Optional[bool] = None,
 ) -> Dict[str, object]:
     """Train both agents; return a stats dict (also written to disk)."""
     episodes = int(episodes if episodes is not None else cfg.episodes)
@@ -61,9 +62,19 @@ def run_training(
     torch.manual_seed(base_seed)
     np.random.seed(base_seed)
 
+    if use_learned_vmaf is not None:
+        cfg.use_learned_vmaf = bool(use_learned_vmaf)
+    vmaf_fn = cfg.build_vmaf_fn()
+    if cfg.use_learned_vmaf:
+        print("App reward: using learned WebRTC QoS->VMAF surrogate", flush=True)
+
     dp = cfg.make_dataplane(backend, seed=base_seed, show_output=show_output)
     env = HierarchicalRealtimeEnv(
-        dp, video=cfg.video, weights=cfg.weights, episode_seconds=cfg.episode_seconds
+        dp,
+        video=cfg.video,
+        weights=cfg.weights,
+        episode_seconds=cfg.episode_seconds,
+        vmaf_fn=vmaf_fn,
     )
     # First reset establishes num_paths (needed to size the transport agent).
     env.reset(seed=base_seed)
@@ -148,7 +159,10 @@ def _run_episode(
         split, t_raw = transport.select(t_obs)
         next_obs, t_r, done, info = env.step(target_kbps, split)
         t_next_obs = env.build_transport_obs(next_obs, target_kbps)
-        transport.store(t_obs, t_raw, t_r, t_next_obs, done)
+        # The episode horizon is a time-limit *truncation*, not a real terminal
+        # (the call could continue), so always bootstrap off the next state
+        # (done=False) to keep the policy horizon-agnostic.
+        transport.store(t_obs, t_raw, t_r, t_next_obs, False)
         transport.update()
 
         ep_t_r += t_r
@@ -158,11 +172,12 @@ def _run_episode(
         bitrates.append(target_kbps)
         obs = next_obs
 
-    # Credit the final (partial) App window.
+    # Credit the final (partial) App window. The horizon is a truncation, not a
+    # real terminal, so bootstrap off the final observation (done=False).
     if prev_app_obs is not None:
         app_r, comps = env.pop_app_window_reward()
         final_app_obs = env.build_app_obs(obs)
-        app.store(prev_app_obs, prev_app_raw, app_r, final_app_obs, True)
+        app.store(prev_app_obs, prev_app_raw, app_r, final_app_obs, False)
         app.update()
         ep_app_r += app_r
         n_app += 1
@@ -189,5 +204,6 @@ def _config_summary(cfg: ExperimentConfig) -> Dict[str, object]:
         "deadline_ms": cfg.deadline_ms,
         "bitrate_kbps": [cfg.video.min_bitrate_kbps, cfg.video.max_bitrate_kbps],
         "reward_weights": cfg.weights.to_dict(),
+        "use_learned_vmaf": cfg.use_learned_vmaf,
         "paths": cfg.paths,
     }

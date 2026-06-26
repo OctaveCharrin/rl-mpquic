@@ -34,6 +34,11 @@ def main() -> None:
     p.add_argument("--out", default=None, help="output run dir (default runs/eval-<ts>)")
     p.add_argument("--figures", action="store_true", help="render figures after evaluating")
     p.add_argument("--show-output", action="store_true", help="stream NS-3 stdout/stderr")
+    p.add_argument(
+        "--learned-vmaf",
+        action="store_true",
+        help="score QoE with the learned QoS->VMAF surrogate (match how you trained)",
+    )
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -48,6 +53,7 @@ def main() -> None:
         show_output=args.show_output,
         out_dir=out_dir,
         save_json=True,
+        use_learned_vmaf=args.learned_vmaf or None,
     )
 
     if args.figures:

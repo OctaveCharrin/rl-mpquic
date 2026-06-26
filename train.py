@@ -23,6 +23,12 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=None, help="override base seed")
     p.add_argument("--out-dir", default=None, help="run output directory")
     p.add_argument("--show-output", action="store_true", help="stream NS-3 stdout/stderr")
+    p.add_argument(
+        "--learned-vmaf",
+        action="store_true",
+        help="use the WebRTC-grounded learned QoS->VMAF surrogate for the App reward "
+        "(default: bitrate-only log curve)",
+    )
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -33,6 +39,7 @@ def main() -> None:
         seed=args.seed,
         out_dir=args.out_dir,
         show_output=args.show_output,
+        use_learned_vmaf=args.learned_vmaf or None,
     )
 
 

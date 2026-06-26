@@ -33,6 +33,15 @@ reward:
   d_loss: 1.0
   latency_norm_ms: 200.0
   jitter_norm_ms: 50.0
+  # Utilization reward (delivered-bitrate). Only applied with the learned VMAF
+  # scorer, whose grid is ~bitrate-flat; restores the rate-control gradient so
+  # aggregating paths to push more on-time bits actually pays. Gated by (1-loss).
+  e_util: 0.25              # kept modest so the reward stays below the +1.0 clip
+  util_norm_kbps: 3300.0     # the VMAF quality knee; bitrate at which util -> 1
+  # Set true (or pass --learned-vmaf) to score quality with the WebRTC-grounded
+  # learned QoS->VMAF surrogate instead of the bitrate-only log curve.
+  # use_learned_vmaf: false
+  # learned_vmaf_model: null   # optional explicit path to reward_model.npz
 
 sac:
   hidden_dim: 256

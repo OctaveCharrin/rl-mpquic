@@ -22,7 +22,7 @@ from ..ns3env.dataplane import (
     Ns3Config,
     Ns3DataPlane,
 )
-from ..ns3env.qoe import QoEWeights
+from ..ns3env.qoe import QoEWeights, VmafFn
 from ..ns3env.video_source import VideoSourceConfig
 from ..rl.sac_agent import SACConfig
 
@@ -65,6 +65,20 @@ class ExperimentConfig:
     seed: int = 1
     cap_mbps: float = 10.0
     out_dir: str = "runs"
+    # Use the WebRTC-grounded learned QoS->VMAF surrogate for the App reward's
+    # quality term instead of the default bitrate-only log curve.
+    use_learned_vmaf: bool = False
+    learned_vmaf_model: Optional[str] = None  # optional explicit model path
+
+    # -- derived objects ---------------------------------------------------- #
+
+    def build_vmaf_fn(self) -> Optional[VmafFn]:
+        """Learned VMAF scorer if enabled, else None (default log curve)."""
+        if not self.use_learned_vmaf:
+            return None
+        from ..ns3env.learned_vmaf import load_learned_vmaf_fn
+
+        return load_learned_vmaf_fn(self.learned_vmaf_model)
 
     # -- derived backends --------------------------------------------------- #
 
@@ -73,13 +87,17 @@ class ExperimentConfig:
         base_rtt = [2.0 * parse_delay_ms(p["delay"]) for p in self.paths]
         cross = [float(p.get("cross_frac", 0.4)) for p in self.paths]
         n = len(self.paths)
+        # Per-path seasonality periods, cycled so any path count is covered
+        # (truncating to [:n] under-fills when n exceeds the base list length).
+        seasons = [12.0, 7.0, 20.0]
+        cross_periods = [5.0, 3.0, 8.0]
         cfg = MockRealtimeConfig(
             base_mbps=base_mbps,
             base_rtt_ms=base_rtt,
             amp=[0.45 + 0.1 * (i % 3) for i in range(n)],
-            period_s=[12.0, 7.0, 20.0][:n] or [12.0] * n,
+            period_s=[seasons[i % len(seasons)] for i in range(n)],
             cross_frac=cross,
-            cross_period_s=[5.0, 3.0, 8.0][:n] or [5.0] * n,
+            cross_period_s=[cross_periods[i % len(cross_periods)] for i in range(n)],
             fps=self.fps,
             episode_seconds=self.episode_seconds,
             app_period_s=self.app_period_s,
@@ -138,7 +156,11 @@ def load_config(path: Optional[str] = None) -> ExperimentConfig:
     )
     cfg.fps = cfg.video.fps
 
-    cfg.weights = QoEWeights.from_mapping(data.get("reward", {}))
+    reward = data.get("reward", {})
+    cfg.weights = QoEWeights.from_mapping(reward)
+    cfg.use_learned_vmaf = bool(reward.get("use_learned_vmaf", False))
+    model_path = reward.get("learned_vmaf_model")
+    cfg.learned_vmaf_model = str(model_path) if model_path else None
 
     ep = data.get("episode", {})
     cfg.episode_seconds = float(ep.get("seconds", 30.0))
