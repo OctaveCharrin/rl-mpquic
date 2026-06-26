@@ -103,6 +103,15 @@ class QoEWeights:
     ``c_jitter`` penalize latency/jitter after normalizing by ``*_norm_ms``;
     ``d_loss`` penalizes the deadline-miss (loss) fraction. Defaults are balanced
     so a fully congested frame (high latency + loss) roughly cancels top quality.
+
+    ``e_util`` adds a *utilization* reward for delivered bitrate, normalized by
+    ``util_norm_kbps`` (the quality knee) and gated by ``(1 - loss)`` so it only
+    pays for bits that land on time. It is **only applied with a learned VMAF
+    scorer**, whose grid is nearly bitrate-flat; it restores the rate-control
+    gradient (more delivered bits is good) that the surrogate erases, so the agent
+    must aggregate paths to earn it without eating latency/loss. The default
+    log-curve VMAF is already bitrate-sensitive, so the term is skipped there.
+    Default ``e_util = 0.0`` keeps it off unless explicitly enabled in config.
     """
 
     a_quality: float = 1.0
@@ -111,6 +120,8 @@ class QoEWeights:
     d_loss: float = 1.0
     latency_norm_ms: float = 200.0
     jitter_norm_ms: float = 50.0
+    e_util: float = 0.0
+    util_norm_kbps: float = 3300.0
 
     def to_dict(self) -> Dict[str, float]:
         return asdict(self)
@@ -127,6 +138,8 @@ class QoEWeights:
             "d_loss",
             "latency_norm_ms",
             "jitter_norm_ms",
+            "e_util",
+            "util_norm_kbps",
         ):
             if key in data:
                 setattr(base, key, float(data[key]))
@@ -164,7 +177,9 @@ def compute_qoe_reward(
 
       The latency/jitter penalties are intentionally kept: the current learned
       model does not separate those out (its delay/jitter grid axes are
-      degenerate), so they must remain priced explicitly.
+      degenerate), so they must remain priced explicitly. A ``e_util`` utilization
+      reward (delivered-bitrate, see :class:`QoEWeights`) is also added here to
+      restore the bitrate gradient the surrogate erases.
     """
     w = weights or QoEWeights()
     q = _score_vmaf(
@@ -180,7 +195,13 @@ def compute_qoe_reward(
     # (double-count); the default bitrate-only curve does not, so it is kept.
     los = min(1.0, max(0.0, loss))
     loss_penalty = 0.0 if vmaf_fn is not None else w.d_loss * los
-    r = w.a_quality * q - w.b_latency * lat - w.c_jitter * jit - loss_penalty
+    # Utilization reward: only with a (bitrate-flat) learned VMAF, and gated by
+    # (1 - loss) so it credits delivered, on-time bits — not over-sending.
+    util_reward = 0.0
+    if vmaf_fn is not None and w.e_util > 0.0:
+        util = min(1.0, max(0.0, bitrate_kbps) / max(w.util_norm_kbps, 1e-6))
+        util_reward = w.e_util * (1.0 - los) * util
+    r = w.a_quality * q - w.b_latency * lat - w.c_jitter * jit - loss_penalty + util_reward
     return float(max(-2.0, min(1.0, r)))
 
 
