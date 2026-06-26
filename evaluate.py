@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
-Evaluate a trained policy against split/bitrate baselines.
+Evaluate a trained policy against split/bitrate baselines and dump rich results.
+
+Writes ``<out>/evaluation_results.json`` (summary + distributions + traces +
+per-method decision timings). Pass ``--figures`` to also render the figure set
+via ``evaluation/generate_figures.py``.
 
 Examples:
-    python evaluate.py --backend mock --app runs/<ts>/app.pth --transport runs/<ts>/transport.pth
+    python evaluate.py --backend mock --app runs/<ts>/app.pth --transport runs/<ts>/transport.pth --figures
     python evaluate.py --backend mock            # baselines only
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
+import sys
+import time
 
 from src.train.config import load_config
 from src.train.evaluate import run_evaluation
@@ -23,10 +31,13 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=1000)
     p.add_argument("--app", default=None, help="App agent checkpoint (app.pth)")
     p.add_argument("--transport", default=None, help="Transport agent checkpoint (transport.pth)")
+    p.add_argument("--out", default=None, help="output run dir (default runs/eval-<ts>)")
+    p.add_argument("--figures", action="store_true", help="render figures after evaluating")
     p.add_argument("--show-output", action="store_true", help="stream NS-3 stdout/stderr")
     args = p.parse_args()
 
     cfg = load_config(args.config)
+    out_dir = args.out or os.path.join(cfg.out_dir, "eval-" + time.strftime("%Y%m%d-%H%M%S"))
     run_evaluation(
         cfg,
         backend=args.backend,
@@ -35,7 +46,14 @@ def main() -> None:
         app_ckpt=args.app,
         transport_ckpt=args.transport,
         show_output=args.show_output,
+        out_dir=out_dir,
+        save_json=True,
     )
+
+    if args.figures:
+        script = os.path.join(os.path.dirname(__file__), "evaluation", "generate_figures.py")
+        print(f"\nrendering figures from {out_dir} ...")
+        subprocess.run([sys.executable, script, out_dir], check=False)
 
 
 if __name__ == "__main__":
