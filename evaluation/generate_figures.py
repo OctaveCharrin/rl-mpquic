@@ -435,7 +435,13 @@ def fig_path_metrics(traces, meta, order, fig_dir):
     axes[3].set_ylim(0, 1)
     axes[2].set_xlabel("Time (s)")
     axes[3].set_xlabel("Time (s)")
-    axes[0].legend(fontsize=7, loc="upper right")
+    # Attach the path-color legend to whichever panel actually has lines: the
+    # throughput panel may be empty for a partially-populated trace, and an
+    # empty axes[0].legend() would silently drop the only path-color key.
+    for ax in axes:
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=7, loc="upper right")
+            break
     fig.suptitle(f"Per-Path Network State & Allocation — {disp(pick)}")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     _save(fig, fig_dir, "figure10_path_metrics")
@@ -540,9 +546,8 @@ def fig_ablation(summary, fig_dir):
         vals = [val(m) for m in show]
         errs = [err(m) for m in show] if err else None
         bars = ax.bar(x, vals, yerr=errs, capsize=3, color=[col(m) for m in show])
-        for bar, m in zip(bars, show):
-            bar.set(edgecolor="black", linewidth=1.6 if _is_ours(m) else 0.6,
-                    hatch="" if m in ABLATION_ORDER else "//")
+        for bar, m, edge in zip(bars, show, _bar_edges(show)):
+            bar.set(**edge, hatch="" if m in ABLATION_ORDER else "//")
         ax.set_xticks(x)
         ax.set_xticklabels([disp(m) for m in show], rotation=35, ha="right")
         ax.set_ylabel(ylabel)
