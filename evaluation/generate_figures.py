@@ -23,6 +23,9 @@ Figures (written to <run_dir>/figures/):
     figure7_split_behavior.png Learned per-path split over time
     figure8_latency_cdf.png    Latency CDF + deadline-miss rate
     figure9_radar.png          Normalized multi-metric radar
+    figure10_path_metrics.png  Per-path throughput/sRTT/loss/split over time
+    figure11_app_bitrate.png   App-agent bitrate decisions, distribution, quality
+    figure12_ablation.png      Single-agent ablation (only with --ablation runs)
     summary_table.csv          Machine-readable summary
 """
 
@@ -66,16 +69,22 @@ FULL_WIDTH = 7.0
 
 DISPLAY = {
     "learned": "Hierarchical RL (Ours)",
+    "app_only": "App Agent Only",
+    "transport_only": "Transport Agent Only",
     "even": "Even Split",
     "single": "Single Best",
     "proportional": "Proportional",
 }
 COLORS = {
     "learned": "#1f77b4",
+    "app_only": "#17becf",
+    "transport_only": "#9467bd",
     "even": "#ff7f0e",
     "single": "#2ca02c",
     "proportional": "#d62728",
 }
+# Ablation variants (one learned agent disabled), in display order.
+ABLATION_ORDER = ("learned", "app_only", "transport_only")
 _FALLBACK_COLORS = ["#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
 
 
@@ -138,6 +147,17 @@ def _rolling(y, w):
         return y
     k = np.ones(w) / w
     return np.convolve(y, k, mode="same")
+
+
+def _episode_time(t):
+    """Zero-base a trace time axis to its episode start.
+
+    Older evaluation JSONs recorded absolute sim time, and the NS-3 clock is
+    monotonic across episodes/methods, so each method's trace can start at a
+    different offset. Subtracting the first sample realigns every trace at t=0
+    (and is a harmless no-op for traces that already start at 0)."""
+    t = np.asarray(t, dtype=float)
+    return t - t[0] if t.size else t
 
 
 def _norm_higher_better(vals):
@@ -305,7 +325,7 @@ def fig_timeseries(traces, meta, order, fig_dir):
     for ax, (field, ylabel, mark_deadline) in zip(axes, panels):
         for m in order:
             tr = traces.get(m, {})
-            t = np.asarray(tr.get("t", []), dtype=float)
+            t = _episode_time(tr.get("t", []))
             y = np.asarray(tr.get(field, []), dtype=float)
             if t.size == 0 or y.size == 0:
                 continue
@@ -329,7 +349,7 @@ def fig_split_behavior(traces, meta, order, fig_dir):
     if pick is None:
         return
     tr = traces.get(pick, {})
-    t = np.asarray(tr.get("t", []), dtype=float)
+    t = _episode_time(tr.get("t", []))
     split = np.asarray(tr.get("split", []), dtype=float)
     if t.size == 0 or split.size == 0:
         return
@@ -350,6 +370,191 @@ def fig_split_behavior(traces, meta, order, fig_dir):
     ax.set_title(f"Learned Path-Split Behavior — {disp(pick)}")
     ax.legend(ncol=n_paths, fontsize=7, loc="upper right")
     _save(fig, fig_dir, "figure7_split_behavior")
+
+
+def _path_label(meta, i):
+    paths = meta.get("paths", [])
+    label = f"Path {i}"
+    if i < len(paths) and isinstance(paths[i], dict):
+        rate = paths[i].get("rate", "")
+        if rate:
+            label += f" ({rate})"
+    return label
+
+
+def fig_path_metrics(traces, meta, order, fig_dir):
+    """Per-path network state + the policy's allocation over time, so one can see
+    how the paths evolve and how the Transport agent reacts. Uses the learned
+    policy's representative episode (else the first method with per-path traces)."""
+    pick = "learned" if "learned" in traces else (order[0] if order else None)
+    if pick is None:
+        return
+    tr = traces.get(pick, {})
+    t = _episode_time(tr.get("t", []))
+    if t.size == 0:
+        return
+
+    def _as2d(field):
+        arr = np.asarray(tr.get(field, []), dtype=float)
+        if arr.size == 0:
+            return None
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        return arr
+
+    pthr = _as2d("path_throughput_mbps")
+    psrtt = _as2d("path_srtt_ms")
+    ploss = _as2d("path_loss")
+    split = _as2d("split")
+    candidates = [a for a in (pthr, psrtt, ploss, split) if a is not None]
+    if not candidates:
+        return
+    n_paths = max(a.shape[1] for a in candidates)
+    fps = int(round(meta.get("fps", 30)))
+    path_colors = plt.cm.viridis(np.linspace(0.15, 0.85, max(n_paths, 1)))
+
+    panels = [
+        (pthr, "Per-path goodput (Mbps)", "(a) Path Throughput", False),
+        (psrtt, "Per-path sRTT (ms)", "(b) Path Latency", True),
+        (ploss, "Per-path loss", "(c) Path Loss", True),
+        (split, "Traffic split fraction", "(d) Allocated Split", False),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(FULL_WIDTH, 5.5), sharex=True)
+    axes = axes.ravel()
+    for ax, (data, ylabel, title, smooth) in zip(axes, panels):
+        if data is not None:
+            for i in range(data.shape[1]):
+                y = data[:, i]
+                if smooth:
+                    y = _rolling(y, fps)
+                ax.plot(t[: len(y)], y, color=path_colors[i % len(path_colors)],
+                        lw=1.3, label=_path_label(meta, i))
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(alpha=0.3)
+    axes[3].set_ylim(0, 1)
+    axes[2].set_xlabel("Time (s)")
+    axes[3].set_xlabel("Time (s)")
+    axes[0].legend(fontsize=7, loc="upper right")
+    fig.suptitle(f"Per-Path Network State & Allocation — {disp(pick)}")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    _save(fig, fig_dir, "figure10_path_metrics")
+
+
+def fig_app_bitrate(traces, distributions, summary, meta, order, fig_dir):
+    """How the App agent picks the target bitrate: its trajectory vs available
+    goodput, the spread of chosen bitrates, and the quality it buys."""
+    # Wide top row for the time series (it needs the width + a legend), with the
+    # distribution / quality panels sharing the bottom row.
+    fig = plt.figure(figsize=(FULL_WIDTH, 5.2))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.1, 1.0], hspace=0.45, wspace=0.3)
+    a1 = fig.add_subplot(gs[0, :])
+    a2 = fig.add_subplot(gs[1, 0])
+    a3 = fig.add_subplot(gs[1, 1])
+    fps = int(round(meta.get("fps", 30)))
+    bounds = meta.get("bitrate_kbps", None)
+
+    # (a) Bitrate decisions over time (step: bitrate persists across the window),
+    #     over a light envelope of the achieved goodput for context.
+    pick = "learned" if "learned" in traces else (order[0] if order else None)
+    if pick:
+        ptr = traces.get(pick, {})
+        pt = _episode_time(ptr.get("t", []))
+        pthr = np.asarray(ptr.get("throughput_mbps", []), dtype=float) * 1000.0
+        if pt.size and pthr.size:
+            a1.fill_between(pt, 0.0, _rolling(pthr, fps), color="gray", alpha=0.15,
+                            zorder=0, label=f"{disp(pick)} goodput")
+    for m in order:
+        tr = traces.get(m, {})
+        t = _episode_time(tr.get("t", []))
+        br = np.asarray(tr.get("bitrate_kbps", []), dtype=float)
+        if t.size == 0 or br.size == 0:
+            continue
+        a1.step(t, br, where="post", color=col(m), lw=1.8 if _is_ours(m) else 1.0,
+                alpha=0.95 if _is_ours(m) else 0.7, label=disp(m))
+    if bounds:
+        a1.axhline(bounds[0], ls=":", lw=0.8, color="black")
+        a1.axhline(bounds[1], ls=":", lw=0.8, color="black")
+    a1.set_xlabel("Time (s)")
+    a1.set_ylabel("Target bitrate (kbps)")
+    a1.set_title("(a) App Bitrate Decisions over Time")
+    a1.legend(fontsize=7, ncol=3, loc="upper center")
+    a1.grid(alpha=0.3)
+
+    # (b) Distribution of chosen bitrates per method.
+    data = [np.asarray(distributions[m]["bitrate_kbps"], dtype=float) for m in order]
+    data = [d if d.size else np.array([0.0]) for d in data]
+    bp = a2.boxplot(data, widths=0.6, patch_artist=True, showfliers=False)
+    for patch, m in zip(bp["boxes"], order):
+        patch.set_facecolor(col(m))
+        patch.set_alpha(0.7)
+    for med in bp["medians"]:
+        med.set_color("black")
+    a2.set_xticks(range(1, len(order) + 1))
+    a2.set_xticklabels([disp(m) for m in order], rotation=35, ha="right")
+    a2.set_ylabel("Target bitrate (kbps)")
+    a2.set_title("(b) Bitrate Distribution")
+    a2.grid(axis="y", alpha=0.3)
+
+    # (c) Quality return on the chosen bitrate (mean VMAF vs mean bitrate).
+    for m in order:
+        x = summary[m]["bitrate_kbps"]["mean"]
+        y = summary[m]["vmaf"]["mean"]
+        a3.scatter(x, y, s=110 if _is_ours(m) else 60, color=col(m),
+                   edgecolor="black", linewidth=1.4 if _is_ours(m) else 0.6,
+                   marker="*" if _is_ours(m) else "o", zorder=3)
+        a3.annotate(disp(m), (x, y), textcoords="offset points", xytext=(5, 4),
+                    fontsize=7)
+    a3.set_xlabel("Mean target bitrate (kbps)")
+    a3.set_ylabel("Mean VMAF")
+    a3.set_title("(c) Quality vs Bitrate")
+    a3.grid(alpha=0.3)
+    _save(fig, fig_dir, "figure11_app_bitrate")
+
+
+def fig_ablation(summary, fig_dir):
+    """Single-agent ablation: the contribution of each learned agent.
+
+    Compares the full hierarchical controller to variants with one agent
+    disabled (``app_only`` = Transport off, ``transport_only`` = App off), with
+    the best heuristic baseline (hatched) for reference. Skipped unless at least
+    one ablation variant is present in the results."""
+    methods = [m for m in ABLATION_ORDER if m in summary]
+    if "learned" not in summary or len(methods) < 2:
+        return
+    baselines = [m for m in summary if m not in ABLATION_ORDER]
+    ref = max(baselines, key=lambda m: summary[m]["qoe"]["mean"]) if baselines else None
+    show = methods + ([ref] if ref else [])
+
+    panels = [
+        ("QoE", lambda m: summary[m]["qoe"]["mean"],
+         lambda m: summary[m]["qoe"]["std"], "App QoE (per window)", "{:.3f}"),
+        ("Perceptual Quality", lambda m: summary[m]["vmaf"]["mean"],
+         None, "VMAF (0-100)", "{:.1f}"),
+        ("Deadline Misses", lambda m: 100.0 * summary[m]["deadline_miss_rate"],
+         None, "Deadline-miss (%)", "{:.1f}"),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(FULL_WIDTH, 3.4))
+    x = np.arange(len(show))
+    for ax, (title, val, err, ylabel, fmt) in zip(axes, panels):
+        vals = [val(m) for m in show]
+        errs = [err(m) for m in show] if err else None
+        bars = ax.bar(x, vals, yerr=errs, capsize=3, color=[col(m) for m in show])
+        for bar, m in zip(bars, show):
+            bar.set(edgecolor="black", linewidth=1.6 if _is_ours(m) else 0.6,
+                    hatch="" if m in ABLATION_ORDER else "//")
+        ax.set_xticks(x)
+        ax.set_xticklabels([disp(m) for m in show], rotation=35, ha="right")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(axis="y", alpha=0.3)
+        for i, v in enumerate(vals):
+            ax.text(i, v, fmt.format(v), ha="center",
+                    va="bottom" if v >= 0 else "top", fontsize=7)
+    axes[1].set_ylim(0, 100)
+    fig.suptitle("Single-Agent Ablation — Contribution of Each Learned Agent")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    _save(fig, fig_dir, "figure12_ablation")
 
 
 def fig_latency_cdf(summary, distributions, order, meta, fig_dir):
@@ -494,6 +699,9 @@ def generate_all(run_dir: str) -> str:
     fig_split_behavior(traces, meta, order, fig_dir)
     fig_latency_cdf(summary, distributions, order, meta, fig_dir)
     fig_radar(summary, order, fig_dir)
+    fig_path_metrics(traces, meta, order, fig_dir)
+    fig_app_bitrate(traces, distributions, summary, meta, order, fig_dir)
+    fig_ablation(summary, fig_dir)
 
     csv_path = os.path.join(fig_dir, "summary_table.csv")
     write_summary_csv(summary, order, csv_path)

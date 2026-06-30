@@ -39,7 +39,16 @@ def main() -> None:
         action="store_true",
         help="score QoE with the learned QoS->VMAF surrogate (match how you trained)",
     )
+    p.add_argument(
+        "--ablation",
+        action="store_true",
+        help="add single-agent ablations (app_only / transport_only) to isolate "
+        "each agent's contribution; requires --app and --transport",
+    )
     args = p.parse_args()
+
+    if args.ablation and not (args.app and args.transport):
+        p.error("--ablation requires both --app and --transport checkpoints")
 
     cfg = load_config(args.config)
     out_dir = args.out or os.path.join(cfg.out_dir, "eval-" + time.strftime("%Y%m%d-%H%M%S"))
@@ -54,6 +63,7 @@ def main() -> None:
         out_dir=out_dir,
         save_json=True,
         use_learned_vmaf=args.learned_vmaf or None,
+        ablation=args.ablation,
     )
 
     if args.figures:

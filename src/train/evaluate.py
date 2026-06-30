@@ -116,11 +116,17 @@ def _rollout(
     """
     obs = env.reset(seed=seed)
     target = obs.current_bitrate_kbps
+    # Episode-relative time origin. The NS-3 sim clock is monotonic across
+    # episodes/methods (it does not reset on ACT_RESET), so record time relative
+    # to this episode's start to keep traces aligned at t=0 (no-op for the mock).
+    t0 = float(obs.clock_s)
 
     # Per-frame trace (ordered).
     t_axis, lat, los, jit, br, thr = [], [], [], [], [], []
     split_tr: List[List[float]] = []
     pthr_tr: List[List[float]] = []
+    psrtt_tr: List[List[float]] = []  # per-path sRTT (ms)
+    ploss_tr: List[List[float]] = []  # per-path loss
     tdec: List[float] = []          # transport decision ms (every frame)
     # Per-window (App cadence).
     win_qoe, win_vmaf, app_dec = [], [], []
@@ -141,7 +147,7 @@ def _rollout(
         tdec.append(t_ms)
         next_obs, _t_r, done, info = env.step(target, split)
 
-        t_axis.append(float(obs.clock_s))
+        t_axis.append(float(obs.clock_s) - t0)
         lat.append(info.latency_ms)
         los.append(info.loss)
         jit.append(info.jitter_ms)
@@ -149,6 +155,8 @@ def _rollout(
         thr.append(float(next_obs.throughput_mbps))
         split_tr.append([float(x) for x in np.atleast_1d(split)])
         pthr_tr.append([float(x) for x in obs.path_throughput_mbps])
+        psrtt_tr.append([float(x) for x in obs.srtt_ms])
+        ploss_tr.append([float(x) for x in obs.path_loss])
         obs = next_obs
 
     if have_window:
@@ -167,6 +175,8 @@ def _rollout(
             "throughput_mbps": thr,
             "split": split_tr,
             "path_throughput_mbps": pthr_tr,
+            "path_srtt_ms": psrtt_tr,
+            "path_loss": ploss_tr,
             "transport_decision_ms": tdec,
         },
         "dist": {
@@ -237,6 +247,7 @@ def run_evaluation(
     out_dir: Optional[str] = None,
     save_json: bool = True,
     use_learned_vmaf: Optional[bool] = None,
+    ablation: bool = False,
 ) -> Dict[str, object]:
     """Evaluate baselines (+ learned policy if checkpoints given).
 
@@ -246,6 +257,15 @@ def run_evaluation(
 
     ``use_learned_vmaf`` (when not None) overrides ``cfg.use_learned_vmaf`` so
     QoE is scored with the learned QoS->VMAF surrogate, matching how you trained.
+
+    ``ablation`` (requires both checkpoints) adds two single-agent variants that
+    disable one learned agent by swapping in its heuristic counterpart, to
+    isolate each agent's contribution:
+
+    * ``transport_only`` -- App agent disabled: reactive heuristic bitrate +
+      learned per-path split. Compare to ``even`` / ``proportional``.
+    * ``app_only``       -- Transport agent disabled: learned bitrate + even
+      split. Compare to ``even`` (same split, heuristic vs learned bitrate).
     """
     if use_learned_vmaf is not None:
         cfg.use_learned_vmaf = bool(use_learned_vmaf)
@@ -267,7 +287,14 @@ def run_evaluation(
         "random": (bitrate_heur, _random_split(seed)),
     }
     if app_ckpt and transport_ckpt:
-        policies["learned"] = _learned_policies(env, app_ckpt, transport_ckpt, cfg)
+        learned_bitrate, learned_split = _learned_policies(
+            env, app_ckpt, transport_ckpt, cfg
+        )
+        policies["learned"] = (learned_bitrate, learned_split)
+        if ablation:
+            # Disable one agent at a time by substituting its heuristic.
+            policies["transport_only"] = (bitrate_heur, learned_split)  # App off
+            policies["app_only"] = (learned_bitrate, _even_split)       # Transport off
 
     summary: Dict[str, Dict] = {}
     distributions: Dict[str, Dict] = {}
@@ -341,6 +368,7 @@ def run_evaluation(
             "reward_weights": cfg.weights.to_dict(),
             "paths": cfg.paths,
             "has_learned": "learned" in policies,
+            "has_ablation": ablation and "learned" in policies,
         },
         "summary": summary,
         "distributions": distributions,
