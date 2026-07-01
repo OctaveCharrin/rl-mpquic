@@ -460,6 +460,44 @@ cap    = max(0.05, base_mbps · season · max(0.05, 1 − cross) · (1 + N(0, no
 i.e. a sinusoidal capacity envelope, a phase-shifted bursty cross-traffic
 reduction, and multiplicative noise — the fluid analogue of §3.1–3.2.
 
+#### 5.3.1 Non-stationary dynamics and the liveness mask (optional)
+
+The sinusoidal envelope above is smooth and stationary: the *best* path barely
+moves, so the optimal split is nearly constant and a learned scheduler can win
+almost nothing over a fixed/heuristic split (see §11 — on the static topology the
+App-only ablation reaches ~98 % of the full system's QoE). To make *which path to
+send on* a genuinely informative, time-varying decision, the mock supports an
+optional `DynamicsConfig` (`configs/dynamic.yaml`; the NS-3 body has no equivalent
+yet — see the CONTRACT note in §3.8 and §11). It is **off by default**: when
+disabled the dynamic RNG is never drawn, so the static behavior — and its exact
+per-seed draw sequence — is unchanged. Four mechanisms, all deterministic per
+seed and advanced one step per frame (event probability `1 − e^{−rate·Δt}` over a
+frame interval):
+
+- **Path churn (appear/disappear).** Each path is an on/off Markov chain
+  (`churn_up_rate` / `churn_down_rate`, floored at `min_active` live paths). The
+  candidate count `num_paths` is now an *upper bound*; the **active** count varies
+  per frame. A churned-out path reports a dead row and `path_active = 0`; bytes a
+  scheduler routes onto it **never arrive and count as loss** — the penalty that
+  teaches the policy to respect the mask.
+- **Regime shifts (best-path swaps).** A per-path capacity multiplier is resampled
+  `~ Uniform(regime_lo, regime_hi)` at Poisson change-points (`regime_rate`),
+  multiplying the envelope. Because paths shift independently, the *ranking* of
+  paths jumps abruptly rather than drifting.
+- **Congestion bursts.** Poisson per-path events (`burst_rate`) collapse a path's
+  capacity to `burst_intensity` for `burst_duration_s`, which the standing-queue
+  model turns into a latency spike the scheduler must route around within a few
+  frames.
+- **Correlated failures.** `corr_groups` of path indices degrade together during
+  group events (`corr_rate`, `corr_intensity`, `corr_duration_s`), so naive
+  diversification across a shared bottleneck does not help.
+
+The effective per-path capacity is `envelope × regime_mult × burst_mult ×
+corr_mult` (all 1.0 when static). A new `path_active` field on `FrameObs` mirrors
+`EnvStruct.pathActive[]` (which the NS-3 backend fills all-ones until C++ churn
+lands). Delivery folds the fraction of bytes routed onto dead paths into the
+frame's loss, so misrouting is graded, not silent.
+
 Delivery uses a **standing-queue model** that reproduces bufferbloat. Each path
 keeps a `busy_until` serialization clock; delivering `b` bytes on path `i`:
 
@@ -529,6 +567,17 @@ All features are clipped to `[0, 1]` (RTT/jitter clipping saturates at the
 normalizer; nothing is unbounded). The Transport agent therefore sees the full
 per-path transport picture (window, smoothed delay, backlog, recent goodput, loss)
 plus the global demand it must satisfy.
+
+**Structured (scoring) transport state** — `build_transport_state`. The flat
+`4 + 5N` vector hard-codes the path count and order, so it cannot represent a
+*changing* set of paths. For the scoring Transport agent (§7.3) the same features
+are instead delivered as a `(glob, paths, mask)` triple — a 4-D global-context
+vector, a `(N, 6)` per-path matrix (the five flat per-path features **plus the
+liveness flag**), and an `(N,)` mask (`1.0` = live). The path count `N` is fixed
+at the candidate cap for tensor shapes; the *mask*, not the array width, says
+which rows are live, so the policy and critic (which are permutation-equivariant)
+handle any active subset. The flat builder is retained unchanged for the legacy
+`transport_arch: "flat"` agent.
 
 ### 6.2 Two-timescale credit assignment
 
@@ -680,6 +729,37 @@ it keeps the SAC math (entropy, target entropy, log-probabilities) entirely insi
 the well-conditioned `[−1,1]^d` cube while the environment receives physically
 meaningful actions.
 
+#### 7.3.1 Dynamic-input (scoring) Transport agent
+
+The flat agent above is an MLP whose input width is `4 + 5N`, hard-wiring the
+path count and order — it cannot ingest a *changing* set of paths (churn) and must
+relearn per ordering. A second, permutation-equivariant Transport agent
+(`src/rl/scoring_sac_agent.py`, selected by `transport_arch: "scoring"`) removes
+that limitation, adapting the SCION sibling's path-scoring DQN from discrete
+argmax to continuous SAC. It consumes the structured `(glob, paths, mask)` state
+(§6.1):
+
+- **Actor — `ScoringGaussianPolicy`.** A *shared* per-path encoder maps
+  `glob ⊕ path_i` to a tanh-squashed Gaussian latent per path. The latent is the
+  SAC action in `[−1, 1]^N` (exactly the flat agent's raw action); the env split is
+  a **masked softmax** of it over the *active* paths only. Log-probability and
+  entropy are summed over active paths, so dead paths contribute neither density
+  nor gradient.
+- **Critic — `ScoringQNetwork` (twin).** A DeepSets-style encoder consumes
+  `glob ⊕ path_i ⊕ latent_i` per path, **masked-mean-pools** across paths, and maps
+  the pooled embedding to a scalar Q — permutation-invariant and variable-N.
+- **Entropy target** scales with the per-sample active-path count
+  (`−active_count`), not a fixed `−N`, since the effective action dimension shrinks
+  as paths churn out.
+
+Transitions are stored in a `StructuredReplayBuffer` (rectangular fixed-`N`
+arrays + mask, simpler than ragged padding because `N` is the candidate cap). The
+critic, actor, twin-target, and automatic-temperature update are otherwise
+identical to §7.4. Inactive paths are excluded from the log-prob, the pooled
+critic embedding, and the split, so they receive no gradient. Checkpoints are
+tagged `arch: "scoring"`, which evaluation reads back to rebuild the right agent
+(legacy flat checkpoints have no such tag and load as `"flat"`).
+
 ### 7.4 The learning update
 
 One gradient step (`SACAgent._update_once`) on a minibatch (default 256) sampled
@@ -749,6 +829,20 @@ learns to push bitrate up for perceptual quality while the Transport agent keeps
 latency under the deadline by spreading load — the two-sided behavior the reward
 decomposition was designed to induce.
 
+On the **non-stationary** scenario (`configs/dynamic.yaml`, §5.3.1) with the
+scoring Transport agent (§7.3.1), the hierarchy's value becomes stark. A 30-episode
+mock train, 20-episode eval (seed 1000): the learned pair reaches **QoE 0.606**
+(VMAF 85 at ~3.3 Mbps, latency 60 ms, loss 0.05), versus **0.402**
+single-best-active-path, **0.209** proportional, and **0.109** even. Critically,
+the `app_only` ablation — the learned bitrate with a (mask-aware) *even* split —
+**collapses to −0.212** (latency 453 ms, loss 0.42): once paths churn, shift, and
+burst, an even split shoves the encoder's ~2.8 Mbps onto congested or dead paths.
+This is the intended contrast with the *static* topology, where `app_only` reached
+**98 %** of the full system's QoE (0.665 vs 0.676) because the optimal split
+barely moved. Making the network non-stationary — and giving the Transport agent a
+model that can ingest the changing path set — is what turns the split back into a
+decision that matters.
+
 ---
 
 ## 8. The training loop
@@ -817,6 +911,16 @@ The rollout reuses the env's `pop_app_window_reward` machinery so the reported Q
 is computed identically to training. A formatted table prints QoE, VMAF, latency,
 loss, and bitrate per policy.
 
+When the network is dynamic (§5.3.1), the heuristic baselines are **mask-aware**:
+`even`/`single`/`proportional`/`random` all operate over the *active* paths only
+(a dead path gets zero weight), so they are not handicapped by churn they cannot
+see — the comparison still isolates scheduling quality. `_learned_policies` reads
+the Transport checkpoint's `arch` tag and rebuilds either the flat or the scoring
+agent, feeding it the matching (flat vs structured) observation. Each rollout also
+records two dynamics diagnostics per frame — the **active-path count** and the
+**split entropy** (nats; 0 = one path, `ln k` = even over `k` paths) — summarized
+alongside the QoE components.
+
 ---
 
 ## 10. End-to-end worked example: the life of one frame
@@ -873,7 +977,12 @@ deliberate, and arguably correct, real-time framing, but not identical to an
 unreliable-datagram transport. (iii) *Reordering across paths:* the byte-watermark
 tracker measures per-path completion and aggregates to a frame; it does not model
 application-layer resequencing cost beyond the max-arrival latency. (iv)
-*Single client/server, static `N` per run.* (v) *Quality model:* the default VMAF
+*Single client/server.* The mock backend optionally varies the *active* path count
+within a run via churn (§5.3.1), and the scoring Transport agent (§7.3.1) consumes
+that variable set; the **NS-3 body, however, still has a fixed `N` and no churn /
+regime / burst dynamics** — porting them into `realtime_mpquic.cc` (and adding
+`EnvStruct.pathActive[]`) is the natural follow-up the CONTRACT note in §3.8
+anticipates. (v) *Quality model:* the default VMAF
 is a documented log-anchor stand-in, not measured per-content quality; the
 optional `--learned-vmaf` surrogate (§6.3) is grounded in real WebRTC VMAF
 measurements but is still a fixed, content-agnostic grid (bitrate axis saturating
@@ -907,8 +1016,9 @@ mobility per episode for domain randomization.
 |---|---|
 | App observation dim | 5 (horizon-agnostic; no episode-progress feature) |
 | App action dim | 1 (→ bitrate ∈ [300, 6000] kbps) |
-| Transport observation dim | 4 + 5N = 24 (19 for the legacy 3-path config) |
-| Transport action dim | N = 4 (→ softmax split) |
+| Transport observation dim (flat) | 4 + 5N = 24 (19 for the legacy 3-path config) |
+| Transport state dims (scoring) | global 4, per-path 6 (5 + liveness), mask N |
+| Transport action dim | N = 4 (→ softmax split; masked over active paths in scoring) |
 | Bridge exchanges per second | fps = 30 |
 | App decisions per second | 1 (every 30 frames) |
 
@@ -926,6 +1036,8 @@ mobility per episode for domain randomization.
 | SAC hidden / γ / τ / lr | 256 / 0.99 / 0.005 / 3e-4 | `SACConfig` |
 | batch / buffer / start_steps / update_after | 256 / 200k / 1000 / 1000 | `SACConfig` |
 | cwnd / buffer obs normalizers | 200 000 B | `realtime_env.py` |
+| `transport_arch` | `flat` (default) / `scoring` | `configs/*.yaml` `run:` |
+| `dynamics` (churn/regime/burst/corr) | off by default; on in `configs/dynamic.yaml` | `DynamicsConfig`, `dataplane.py` |
 | paths (rate/delay/cross), NS-3 | 3/3/2.5/2 Mbps · 10/15/40/20 ms · 0.40/0.45/0.30/0.55 | `ScenarioConfig`, `configs/four_path.yaml` |
 | `cap_mbps` (throughput normalizer) | 12 (4-path) / 10 (legacy 3-path) | `configs/*.yaml` |
 | paths (rate/delay/cross), legacy mock | 8/4/2 Mbps · 10/17/30 ms · 0.45/0.65/0.35 | `configs/default.yaml` |
@@ -945,14 +1057,16 @@ mobility per episode for domain randomization.
 | `src/ns3env/qos_vmaf_reward.py` + `reward_model.npz` | vendored learned QoS→VMAF surrogate (from `WebRTC-QoE-Data-Generator`) |
 | `src/ns3env/learned_vmaf.py` | adapter: learned surrogate → `vmaf_fn` (unit translation) |
 | `src/ns3env/realtime_env.py` | observation builders, reward windows |
-| `src/rl/sac_agent.py` | generic SAC (actor, twin critics, targets, entropy tuning) |
-| `src/rl/replay_buffer.py` | circular replay buffer |
-| `src/rl/app_agent.py`, `src/rl/transport_agent.py` | action-space wrappers |
+| `src/rl/sac_agent.py` | generic flat SAC (actor, twin critics, targets, entropy tuning) |
+| `src/rl/scoring_sac_agent.py` | permutation-equivariant SAC (per-path scoring actor + DeepSets critic) for variable path counts |
+| `src/rl/replay_buffer.py` | circular replay buffer + `StructuredReplayBuffer` (set-shaped transitions) |
+| `src/rl/app_agent.py`, `src/rl/transport_agent.py` | action-space wrappers (the Transport wrapper dispatches flat vs scoring) |
 | `src/train/config.py` | YAML → typed config; backend factories |
 | `src/train/hierarchical_train.py` | dual-cadence training loop |
 | `src/train/evaluate.py` | rollout + baselines |
 | `train.py`, `evaluate.py` | thin CLIs |
-| `tests/` | mock-only unit + smoke tests |
+| `configs/dynamic.yaml` | non-stationary, variable-path-count scenario (`transport_arch: scoring`) |
+| `tests/` | mock-only unit + smoke tests (incl. `test_dynamics.py`, `test_scoring_agent.py`) |
 
 ---
 

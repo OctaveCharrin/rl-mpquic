@@ -52,6 +52,7 @@ _TRACE_SCALARS = ("t", "latency_ms", "loss", "jitter_ms", "bitrate_kbps", "throu
 _DIST_FIELDS = (
     "qoe", "vmaf", "latency_ms", "jitter_ms", "loss", "bitrate_kbps",
     "throughput_mbps", "app_decision_ms", "transport_decision_ms",
+    "active_paths", "split_entropy",
 )
 
 
@@ -63,21 +64,35 @@ def _heuristic_bitrate(cfg: ExperimentConfig) -> BitrateFn:
     return fn
 
 
+def _active_mask(obs: FrameObs) -> np.ndarray:
+    """Boolean-as-float live-path mask; all-ones when the backend reports none."""
+    pa = obs.path_active
+    if not pa:
+        return np.ones(obs.num_paths, dtype=np.float64)
+    m = (np.asarray(pa, dtype=np.float64) >= 0.5).astype(np.float64)
+    return m if m.any() else np.ones(obs.num_paths, dtype=np.float64)
+
+
 def _even_split(obs: FrameObs, target: float) -> np.ndarray:
-    n = obs.num_paths
-    return np.full(n, 1.0 / n, dtype=np.float32)
+    # Even split over the *active* paths (a dead path gets zero).
+    m = _active_mask(obs)
+    return (m / m.sum()).astype(np.float32)
 
 
 def _single_best(obs: FrameObs, target: float) -> np.ndarray:
     n = obs.num_paths
+    m = _active_mask(obs)
+    thr = np.asarray(obs.path_throughput_mbps, dtype=np.float64) * m  # mask dead paths
     split = np.zeros(n, dtype=np.float32)
-    split[int(np.argmax(obs.path_throughput_mbps))] = 1.0
+    split[int(np.argmax(thr))] = 1.0
     return split
 
 
 def _proportional(obs: FrameObs, target: float) -> np.ndarray:
-    thr = np.asarray(obs.path_throughput_mbps, dtype=np.float64)
-    thr = np.clip(thr, 1e-6, None)
+    m = _active_mask(obs)
+    thr = np.clip(np.asarray(obs.path_throughput_mbps, dtype=np.float64), 0.0, None) * m
+    if thr.sum() <= 0.0:
+        return (m / m.sum()).astype(np.float32)
     return (thr / thr.sum()).astype(np.float32)
 
 
@@ -94,7 +109,11 @@ def _random_split(seed: int) -> SplitFn:
     rng = np.random.default_rng(seed)
 
     def fn(obs: FrameObs, target: float) -> np.ndarray:
-        return rng.dirichlet(np.ones(obs.num_paths)).astype(np.float32)
+        m = _active_mask(obs)
+        idx = np.where(m >= 0.5)[0]
+        out = np.zeros(obs.num_paths, dtype=np.float32)
+        out[idx] = rng.dirichlet(np.ones(len(idx))).astype(np.float32)
+        return out
 
     return fn
 
@@ -128,6 +147,8 @@ def _rollout(
     psrtt_tr: List[List[float]] = []  # per-path sRTT (ms)
     ploss_tr: List[List[float]] = []  # per-path loss
     tdec: List[float] = []          # transport decision ms (every frame)
+    actpaths: List[float] = []      # number of live paths per frame
+    spent: List[float] = []         # split entropy (nats) per frame
     # Per-window (App cadence).
     win_qoe, win_vmaf, app_dec = [], [], []
 
@@ -146,6 +167,13 @@ def _rollout(
         split, t_ms = _timed(split_fn, obs, target)
         tdec.append(t_ms)
         next_obs, _t_r, done, info = env.step(target, split)
+
+        # Dynamics diagnostics: how many paths are live, and how concentrated the
+        # split is (entropy in nats; 0 = one path, ln(k) = even over k paths).
+        actpaths.append(float(sum(obs.path_active)) if obs.path_active else float(obs.num_paths))
+        sp = np.asarray(split, dtype=np.float64)
+        sp = sp[sp > 0]
+        spent.append(float(-(sp * np.log(sp)).sum()) if sp.size else 0.0)
 
         t_axis.append(float(obs.clock_s) - t0)
         lat.append(info.latency_ms)
@@ -189,6 +217,8 @@ def _rollout(
             "throughput_mbps": thr,
             "app_decision_ms": app_dec,
             "transport_decision_ms": tdec,
+            "active_paths": actpaths,
+            "split_entropy": spent,
         },
         "deadline_miss_rate": float(np.mean(los_arr >= 0.999)) if los_arr.size else 0.0,
     }
@@ -204,18 +234,32 @@ def _learned_policies(env, app_path, transport_path, cfg):
         max_kbps=cfg.video.max_bitrate_kbps,
         config=cfg.sac,
     )
-    transport = TransportAgent(env.transport_obs_dim, env.num_paths, config=cfg.sac)
     app.sac.load_state_dict(torch.load(app_path, map_location="cpu"))
-    transport.sac.load_state_dict(torch.load(transport_path, map_location="cpu"))
+
+    # The Transport checkpoint dictates the architecture (a scoring agent tags its
+    # state dict with "arch"); a legacy flat checkpoint has no such key.
+    t_sd = torch.load(transport_path, map_location="cpu")
+    arch = t_sd.get("arch", "flat") if isinstance(t_sd, dict) else "flat"
+    if arch == "scoring":
+        transport = TransportAgent(
+            env.transport_obs_dim, env.num_paths, config=cfg.sac, arch="scoring",
+            global_dim=env.transport_global_dim, path_dim=env.transport_path_dim,
+        )
+    else:
+        transport = TransportAgent(env.transport_obs_dim, env.num_paths, config=cfg.sac)
+    transport.sac.load_state_dict(t_sd)
 
     def bitrate_fn(obs: FrameObs) -> float:
         kbps, _ = app.select(env.build_app_obs(obs), deterministic=True)
         return kbps
 
     def split_fn(obs: FrameObs, target: float) -> np.ndarray:
-        split, _ = transport.select(
-            env.build_transport_obs(obs, target), deterministic=True
+        t_obs = (
+            env.build_transport_state(obs, target)
+            if arch == "scoring"
+            else env.build_transport_obs(obs, target)
         )
+        split, _ = transport.select(t_obs, deterministic=True)
         return split
 
     return bitrate_fn, split_fn
@@ -335,6 +379,8 @@ def run_evaluation(
                 "throughput_mbps": _stats(agg["throughput_mbps"]),
                 "app_decision_ms": _stats(agg["app_decision_ms"]),
                 "transport_decision_ms": _stats(agg["transport_decision_ms"]),
+                "active_paths": _stats(agg["active_paths"]),
+                "split_entropy": _stats(agg["split_entropy"]),
                 "deadline_miss_rate": float(
                     np.mean([r["deadline_miss_rate"] for r in rolls])
                 ),
@@ -366,6 +412,8 @@ def run_evaluation(
             "deadline_ms": cfg.deadline_ms,
             "bitrate_kbps": [cfg.video.min_bitrate_kbps, cfg.video.max_bitrate_kbps],
             "reward_weights": cfg.weights.to_dict(),
+            "transport_arch": cfg.transport_arch,
+            "dynamics_enabled": cfg.dynamics is not None,
             "paths": cfg.paths,
             "has_learned": "learned" in policies,
             "has_ablation": ablation and "learned" in policies,

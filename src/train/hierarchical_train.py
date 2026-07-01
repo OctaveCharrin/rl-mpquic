@@ -32,6 +32,27 @@ from ..rl.transport_agent import TransportAgent
 from .config import ExperimentConfig
 
 
+def _build_transport_agent(cfg: ExperimentConfig, env: HierarchicalRealtimeEnv) -> TransportAgent:
+    """Construct the Transport agent for the configured architecture."""
+    if cfg.transport_arch == "scoring":
+        return TransportAgent(
+            env.transport_obs_dim,
+            env.num_paths,
+            config=cfg.sac,
+            arch="scoring",
+            global_dim=env.transport_global_dim,
+            path_dim=env.transport_path_dim,
+        )
+    return TransportAgent(env.transport_obs_dim, env.num_paths, config=cfg.sac, arch="flat")
+
+
+def _transport_obs(env: HierarchicalRealtimeEnv, obs, target_kbps: float, arch: str):
+    """Build the transport observation matching the agent architecture."""
+    if arch == "scoring":
+        return env.build_transport_state(obs, target_kbps)
+    return env.build_transport_obs(obs, target_kbps)
+
+
 def _app_sac_config(cfg: ExperimentConfig, frames_per_app: int):
     """Scale the App agent's warm-up to its slower (per-second) cadence."""
     fpa = max(1, frames_per_app)
@@ -52,6 +73,7 @@ def run_training(
     seed: Optional[int] = None,
     log_every: int = 1,
     use_learned_vmaf: Optional[bool] = None,
+    resume: bool = False,
 ) -> Dict[str, object]:
     """Train both agents; return a stats dict (also written to disk)."""
     episodes = int(episodes if episodes is not None else cfg.episodes)
@@ -86,13 +108,33 @@ def run_training(
         max_kbps=cfg.video.max_bitrate_kbps,
         config=_app_sac_config(cfg, frames_per_app),
     )
-    transport = TransportAgent(env.transport_obs_dim, env.num_paths, config=cfg.sac)
+    transport = _build_transport_agent(cfg, env)
+
+    app_ckpt = os.path.join(out_dir, "app.pth")
+    transport_ckpt = os.path.join(out_dir, "transport.pth")
+
+    def _save_ckpts() -> None:
+        torch.save(app.sac.state_dict(), app_ckpt)
+        torch.save(transport.sac.state_dict(), transport_ckpt)
+
+    # Optional resume: reload the latest checkpoints and skip the uniform-random
+    # warm-up (the replay buffer restarts empty, so updates resume once it refills)
+    # — lets a long train be split across several shorter, interruptible runs.
+    if resume and os.path.exists(app_ckpt) and os.path.exists(transport_ckpt):
+        app.sac.load_state_dict(torch.load(app_ckpt, map_location="cpu"))
+        transport.sac.load_state_dict(torch.load(transport_ckpt, map_location="cpu"))
+        app.sac._stores = max(app.sac._stores, app.sac.cfg.start_steps)
+        transport.sac._stores = max(transport.sac._stores, transport.sac.cfg.start_steps)
+        print(f"resumed from checkpoints in {out_dir}", flush=True)
 
     history: List[Dict[str, float]] = []
     try:
         for ep in range(episodes):
             stats = _run_episode(env, app, transport, seed=base_seed + ep, episode=ep)
             history.append(stats)
+            # Checkpoint after every episode so an interrupted run still leaves a
+            # usable (latest) model rather than nothing.
+            _save_ckpts()
             if log_every and ep % log_every == 0:
                 print(
                     f"[ep {ep:3d}] QoE={stats['app_reward_mean']:+.3f} "
@@ -105,13 +147,13 @@ def run_training(
     finally:
         dp.close()
 
-    # Persist checkpoints + stats.
-    torch.save(app.sac.state_dict(), os.path.join(out_dir, "app.pth"))
-    torch.save(transport.sac.state_dict(), os.path.join(out_dir, "transport.pth"))
+    # Persist final checkpoints + stats.
+    _save_ckpts()
     result = {
         "backend": backend,
         "episodes": episodes,
         "num_paths": env.num_paths,
+        "transport_arch": cfg.transport_arch,
         "config": _config_summary(cfg),
         "history": history,
     }
@@ -155,10 +197,10 @@ def _run_episode(
             prev_app_obs = cur_app_obs
 
         # --- Transport decision (every frame) ---
-        t_obs = env.build_transport_obs(obs, target_kbps)
+        t_obs = _transport_obs(env, obs, target_kbps, transport.arch)
         split, t_raw = transport.select(t_obs)
         next_obs, t_r, done, info = env.step(target_kbps, split)
-        t_next_obs = env.build_transport_obs(next_obs, target_kbps)
+        t_next_obs = _transport_obs(env, next_obs, target_kbps, transport.arch)
         # The episode horizon is a time-limit *truncation*, not a real terminal
         # (the call could continue), so always bootstrap off the next state
         # (done=False) to keep the policy horizon-agnostic.
@@ -205,5 +247,7 @@ def _config_summary(cfg: ExperimentConfig) -> Dict[str, object]:
         "bitrate_kbps": [cfg.video.min_bitrate_kbps, cfg.video.max_bitrate_kbps],
         "reward_weights": cfg.weights.to_dict(),
         "use_learned_vmaf": cfg.use_learned_vmaf,
+        "transport_arch": cfg.transport_arch,
+        "dynamics": dataclasses.asdict(cfg.dynamics) if cfg.dynamics else None,
         "paths": cfg.paths,
     }

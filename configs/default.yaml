@@ -67,3 +67,6 @@ run:
   seed: 1
   cap_mbps: 10.0           # normalization cap for throughput observations
   out_dir: "runs"
+  # "flat" = legacy fixed-dim MLP transport agent; "scoring" = dynamic-input
+  # model (see configs/dynamic.yaml). This static topology has no `dynamics:`.
+  transport_arch: flat

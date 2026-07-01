@@ -70,6 +70,16 @@ class FrameObs:
     path_throughput_mbps: List[float] = field(default_factory=list)
     path_loss: List[float] = field(default_factory=list)
 
+    # Per-path liveness mask (length == num_paths): 1.0 if the path is currently
+    # usable, 0.0 if it has churned out. With static dynamics every path is always
+    # 1.0. `num_paths` is the *candidate* count (the upper bound); the number of
+    # active paths can vary per frame once churn is enabled.
+    #
+    # CONTRACT: the NS-3 backend must report a matching `EnvStruct.pathActive[]`
+    # once C++-side churn lands (see ns3/realtime_mpquic.h, kMaxPaths). Until then
+    # Ns3DataPlane fills this with all-ones so the contract stays satisfiable.
+    path_active: List[float] = field(default_factory=list)
+
     # Realized result of the most-recently-completed frame.
     last_latency_ms: float = 0.0
     last_jitter_ms: float = 0.0
@@ -167,6 +177,53 @@ class _PathTrace:
 
 
 @dataclass
+class DynamicsConfig:
+    """Optional non-stationary network dynamics for :class:`MockRealtimeDataPlane`.
+
+    All mechanisms are **off by default** so existing configs reproduce
+    bit-for-bit (when ``enabled`` is False the dynamic RNG is never touched, so
+    the base sinusoidal envelope and its draw sequence are unchanged). Turning
+    them on makes *which path to send on* a genuinely time-varying decision:
+
+    * **churn** — paths appear/disappear (an on/off Markov chain per path), so
+      the active path count varies and bytes routed onto a dead path are lost.
+    * **regime** — piecewise-constant capacity multiplier resampled at Poisson
+      change-points, so the *best* path swaps abruptly (not a smooth drift).
+    * **burst** — transient per-path capacity collapses (congestion spikes) that
+      the scheduler must route around within a few frames.
+    * **corr** — shared-bottleneck groups that degrade together, so naive
+      diversification across the group does not help.
+    """
+
+    enabled: bool = False
+
+    # Path churn (appear/disappear). Rates are per-second hazards.
+    churn: bool = False
+    churn_up_rate: float = 0.10      # down -> up
+    churn_down_rate: float = 0.05    # up -> down
+    min_active: int = 1              # never let the active set fall below this
+
+    # Regime shifts (best-path swaps): per-path capacity multiplier resampled at
+    # Poisson change-points, drawn ~ Uniform(regime_lo, regime_hi).
+    regime: bool = False
+    regime_rate: float = 0.20        # change-points per second per path
+    regime_lo: float = 0.35
+    regime_hi: float = 1.30
+
+    # Congestion bursts: per-path transient capacity collapse.
+    burst: bool = False
+    burst_rate: float = 0.15         # bursts per second per path
+    burst_intensity: float = 0.25    # capacity multiplier while bursting
+    burst_duration_s: float = 0.5
+
+    # Correlated failures: groups of path indices that degrade together.
+    corr_groups: Sequence[Sequence[int]] = ()
+    corr_rate: float = 0.05          # group events per second
+    corr_intensity: float = 0.30     # capacity multiplier for all members
+    corr_duration_s: float = 1.0
+
+
+@dataclass
 class MockRealtimeConfig:
     """Configuration for :class:`MockRealtimeDataPlane`.
 
@@ -189,6 +246,9 @@ class MockRealtimeConfig:
     deadline_ms: float = 180.0
     video: VideoSourceConfig = field(default_factory=VideoSourceConfig)
     seed: int = 1
+
+    # Optional non-stationary dynamics (None => fully static, legacy behavior).
+    dynamics: Optional[DynamicsConfig] = None
 
     @property
     def num_paths(self) -> int:
@@ -240,6 +300,96 @@ class MockRealtimeDataPlane(DataPlane):
         self._path_thr_ewma = [t.base_mbps for t in self._traces]
         self._path_loss = [0.0] * n
         self._last = FrameResult(0.0, 0.0, 0.0, 0)
+        self._init_dynamics()
+
+    # -- non-stationary dynamics ------------------------------------------- #
+
+    def _init_dynamics(self) -> None:
+        """(Re)initialize the dynamic-state machines. No-op draw when disabled."""
+        n = self.num_paths
+        self._active = [True] * n
+        self._regime_mult = [1.0] * n
+        self._burst_until = [-1.0] * n
+        self._corr_members: List[set] = []
+        self._corr_until: List[float] = []
+        d = self.config.dynamics
+        if d is None or not d.enabled:
+            return
+        if d.regime:
+            self._regime_mult = [
+                float(self._rng.uniform(d.regime_lo, d.regime_hi)) for _ in range(n)
+            ]
+        self._corr_members = [
+            {int(x) for x in grp if 0 <= int(x) < n} for grp in d.corr_groups
+        ]
+        self._corr_until = [-1.0] * len(self._corr_members)
+
+    def _cap_mult(self, i: int) -> float:
+        """Current dynamic capacity multiplier for path ``i`` (1.0 when static)."""
+        d = self.config.dynamics
+        if d is None or not d.enabled:
+            return 1.0
+        m = self._regime_mult[i]
+        if self._burst_until[i] > self._t:
+            m *= d.burst_intensity
+        for g, members in enumerate(self._corr_members):
+            if self._corr_until[g] > self._t and i in members:
+                m *= d.corr_intensity
+        return m
+
+    def _path_capacity(self, i: int, t: float, rng: np.random.Generator) -> float:
+        """Base sinusoidal envelope scaled by the current dynamic multiplier."""
+        return self._traces[i].capacity_mbps(t, rng) * self._cap_mult(i)
+
+    def _advance_dynamics(self) -> None:
+        """Step the regime/burst/churn/correlation machines by one frame.
+
+        Called at the *end* of ``step_frame`` (after the clock advances), so the
+        next observation and the next delivery both see the same updated state.
+        Event probabilities convert per-second hazards over one frame interval via
+        ``1 - exp(-rate*dt)``. Draw order is fixed (regime, burst, corr, churn) to
+        stay deterministic per seed.
+        """
+        d = self.config.dynamics
+        if d is None or not d.enabled:
+            return
+        t = self._t
+        dt = 1.0 / self.config.fps
+        rng = self._rng
+        n = self.num_paths
+
+        if d.regime:
+            p = 1.0 - math.exp(-d.regime_rate * dt)
+            for i in range(n):
+                if rng.random() < p:
+                    self._regime_mult[i] = float(rng.uniform(d.regime_lo, d.regime_hi))
+        if d.burst:
+            p = 1.0 - math.exp(-d.burst_rate * dt)
+            for i in range(n):
+                if rng.random() < p:
+                    self._burst_until[i] = t + d.burst_duration_s
+        if self._corr_members:
+            p = 1.0 - math.exp(-d.corr_rate * dt)
+            for g in range(len(self._corr_members)):
+                if rng.random() < p:
+                    self._corr_until[g] = t + d.corr_duration_s
+        if d.churn:
+            p_up = 1.0 - math.exp(-d.churn_up_rate * dt)
+            p_down = 1.0 - math.exp(-d.churn_down_rate * dt)
+            nxt = list(self._active)
+            for i in range(n):
+                if self._active[i]:
+                    if rng.random() < p_down:
+                        nxt[i] = False
+                elif rng.random() < p_up:
+                    nxt[i] = True
+            # Never let the active set fall below min_active (bring lowest idx up).
+            if sum(nxt) < d.min_active:
+                for i in range(n):
+                    if sum(nxt) >= d.min_active:
+                        break
+                    nxt[i] = True
+            self._active = nxt
 
     # -- DataPlane API ------------------------------------------------------ #
 
@@ -258,10 +408,21 @@ class MockRealtimeDataPlane(DataPlane):
 
     def current_obs(self) -> FrameObs:
         n = self.num_paths
+        active = self._active
         cwnd, srtt, buf = [], [], []
         for i, tr in enumerate(self._traces):
+            if not active[i]:
+                # A churned-out path reports dead state; the liveness mask lets
+                # the policy/baselines exclude it. srtt = base_rtt is a neutral
+                # placeholder (it is masked out downstream).
+                cwnd.append(0.0)
+                srtt.append(tr.base_rtt_ms)
+                buf.append(0.0)
+                continue
             queue_s = max(0.0, self._busy_until[i] - self._t)
-            cap = tr.capacity_mbps(self._t, np.random.default_rng(self._frame_total * 131 + i))
+            cap = self._path_capacity(
+                i, self._t, np.random.default_rng(self._frame_total * 131 + i)
+            )
             srtt_i = tr.base_rtt_ms + queue_s * 1000.0
             srtt.append(srtt_i)
             # Backlog bytes still queued ahead of "now" on this path.
@@ -285,8 +446,11 @@ class MockRealtimeDataPlane(DataPlane):
             cwnd=cwnd,
             srtt_ms=srtt,
             buffer_occ=buf,
-            path_throughput_mbps=list(self._path_thr_ewma),
-            path_loss=list(self._path_loss),
+            path_throughput_mbps=[
+                self._path_thr_ewma[i] if active[i] else 0.0 for i in range(n)
+            ],
+            path_loss=[self._path_loss[i] if active[i] else 1.0 for i in range(n)],
+            path_active=[1.0 if active[i] else 0.0 for i in range(n)],
             last_latency_ms=self._last.latency_ms,
             last_jitter_ms=self._last.jitter_ms,
             last_loss=self._last.loss,
@@ -304,15 +468,23 @@ class MockRealtimeDataPlane(DataPlane):
             self._cur_bitrate, self._frame_total, self.config.video, self._rng
         )
         shares = _split_bytes(total_bytes, self._cur_split)
+        active = self._active
 
-        # Deliver each share through the per-path queue model.
+        # Deliver each share through the per-path queue model. Bytes routed onto a
+        # churned-out path never arrive and count as lost (the penalty that teaches
+        # the scheduler to respect the liveness mask).
         arrivals: List[float] = []
         net_losses: List[float] = []
+        dropped_bytes = 0
         for i in range(n):
             b = shares[i]
             if b == 0:
                 continue
-            cap = self._traces[i].capacity_mbps(self._t, self._rng)
+            if not active[i]:
+                dropped_bytes += b
+                self._path_loss[i] = 1.0
+                continue
+            cap = self._path_capacity(i, self._t, self._rng)
             ser_s = (b * 8.0) / (cap * 1e6)
             ready = max(self._t, self._busy_until[i])
             finish = ready + ser_s
@@ -326,36 +498,42 @@ class MockRealtimeDataPlane(DataPlane):
             self._path_thr_ewma[i] = 0.6 * self._path_thr_ewma[i] + 0.4 * gp
             self._path_loss[i] = loss_i
 
+        dropped_frac = dropped_bytes / max(1, total_bytes)
         if arrivals:
             completion = max(arrivals)
             latency_ms = (completion - self._t) * 1000.0
-            late = latency_ms > self.config.deadline_ms
-            net_loss = max(net_losses) if net_losses else 0.0
-            app_loss = 1.0 if late else net_loss
-            jitter_ms = (
-                abs(latency_ms - self._prev_latency_ms)
-                if self._prev_latency_ms >= 0.0
-                else 0.0
-            )
-            self._prev_latency_ms = latency_ms
-            goodput_mbps = (total_bytes * 8.0) / (max(latency_ms / 1000.0, 1e-6) * 1e6)
-            self._jitter_ewma = 0.7 * self._jitter_ewma + 0.3 * jitter_ms
-            self._loss_ewma = 0.9 * self._loss_ewma + 0.1 * app_loss
-            self._thr_ewma = 0.7 * self._thr_ewma + 0.3 * goodput_mbps
-            self._rtt_ewma = (
-                latency_ms if self._rtt_ewma <= 0 else 0.8 * self._rtt_ewma + 0.2 * latency_ms
-            )
-            self._last = FrameResult(
-                latency_ms=latency_ms,
-                jitter_ms=jitter_ms,
-                loss=app_loss,
-                bytes_delivered=0 if late else total_bytes,
-            )
+        else:
+            # Whole frame routed onto dead (or empty) paths: a deadline miss.
+            latency_ms = 2.0 * self.config.deadline_ms
+        late = latency_ms > self.config.deadline_ms
+        net_loss = max(net_losses) if net_losses else 0.0
+        base_loss = 1.0 if late else net_loss
+        app_loss = float(min(1.0, max(base_loss, dropped_frac)))
+        jitter_ms = (
+            abs(latency_ms - self._prev_latency_ms) if self._prev_latency_ms >= 0.0 else 0.0
+        )
+        self._prev_latency_ms = latency_ms
+        goodput_mbps = (total_bytes * 8.0) / (max(latency_ms / 1000.0, 1e-6) * 1e6)
+        self._jitter_ewma = 0.7 * self._jitter_ewma + 0.3 * jitter_ms
+        self._loss_ewma = 0.9 * self._loss_ewma + 0.1 * app_loss
+        self._thr_ewma = 0.7 * self._thr_ewma + 0.3 * goodput_mbps
+        self._rtt_ewma = (
+            latency_ms if self._rtt_ewma <= 0 else 0.8 * self._rtt_ewma + 0.2 * latency_ms
+        )
+        delivered = 0 if (late or not arrivals) else (total_bytes - dropped_bytes)
+        self._last = FrameResult(
+            latency_ms=latency_ms,
+            jitter_ms=jitter_ms,
+            loss=app_loss,
+            bytes_delivered=delivered,
+        )
 
-        # Advance the wall clock by one frame interval (real-time cadence).
+        # Advance the wall clock by one frame interval (real-time cadence), then
+        # advance the dynamic state so the next obs/delivery share it.
         self._t += 1.0 / self.config.fps
         self._frame_idx += 1
         self._frame_total += 1
+        self._advance_dynamics()
         return self._last
 
 
@@ -536,6 +714,9 @@ class Ns3DataPlane(DataPlane):
             buffer_occ=[float(e.bufferOcc(i)) for i in range(n)],
             path_throughput_mbps=[float(e.pathThroughput(i)) for i in range(n)],
             path_loss=[float(e.pathLoss(i)) for i in range(n)],
+            # CONTRACT: until EnvStruct grows a pathActive[] field, the C++ body
+            # has no churn, so every reported path is live.
+            path_active=[1.0] * n,
             last_latency_ms=float(e.lastLatencyMs),
             last_jitter_ms=float(e.lastJitterMs),
             last_loss=float(e.lastLoss),

@@ -1,0 +1,89 @@
+# Non-stationary, variable-path-count scenario — the headline test for the
+# scoring (dynamic-input) Transport agent. Mock-backend only (the NS-3 body has
+# no churn yet; see ns3/realtime_mpquic.h CONTRACT note).
+#
+# Design intent: make *which path you send on* an informative, time-varying
+# decision so the split agent actually earns its keep (the static four_path.yaml
+# made app-only ~= the full system). Six candidate paths, none individually
+# sufficient (aggregation mandatory), with paths churning in/out, abrupt
+# best-path swaps (regime shifts), congestion bursts, and one shared-bottleneck
+# correlation group so naive diversification fails.
+topology:
+  paths:
+    - {rate: "3Mbps",   delay: "10ms", cross_frac: 0.40}   # clean, low RTT
+    - {rate: "2.5Mbps", delay: "15ms", cross_frac: 0.45}   # clean
+    - {rate: "2.5Mbps", delay: "40ms", cross_frac: 0.30}   # latency trap
+    - {rate: "2Mbps",   delay: "20ms", cross_frac: 0.55}   # congested
+    - {rate: "3Mbps",   delay: "25ms", cross_frac: 0.50}   # shared-bottleneck A
+    - {rate: "2.5Mbps", delay: "30ms", cross_frac: 0.50}   # shared-bottleneck B
+
+video:
+  fps: 30
+  min_bitrate_kbps: 300
+  max_bitrate_kbps: 6000
+  init_bitrate_kbps: 1500
+  frame_size_jitter: 0.25
+  keyframe_interval: 30
+
+episode:
+  seconds: 30
+  app_period_s: 1.0
+  warmup_s: 1.0
+
+reward:
+  a_quality: 1.0
+  b_latency: 0.5
+  c_jitter: 0.5
+  d_loss: 1.0
+  latency_norm_ms: 200.0
+  jitter_norm_ms: 50.0
+  # Utilization reward — restores the rate-control gradient under the (bitrate-
+  # flat) learned VMAF scorer. Harmless under the default log curve.
+  e_util: 0.25
+  util_norm_kbps: 3300.0
+
+# ---------------------------------------------------------------------------
+# Non-stationary dynamics (mock only). All four mechanisms on. Rates are
+# per-second hazards converted per-frame via 1 - exp(-rate*dt).
+# ---------------------------------------------------------------------------
+dynamics:
+  enabled: true
+  # Paths appear/disappear -> active count varies; bytes on a dead path are lost.
+  churn: true
+  churn_up_rate: 0.30        # a down path tends to recover within ~3 s
+  churn_down_rate: 0.08      # an up path drops every ~12 s
+  min_active: 3              # never fewer than 3 usable paths (of 6)
+  # Abrupt best-path swaps: capacity multiplier resampled at change-points.
+  regime: true
+  regime_rate: 0.20          # ~one change-point per path per 5 s
+  regime_lo: 0.55            # kept survivable: the mechanisms compound
+  regime_hi: 1.25
+  # Transient per-path congestion collapses.
+  burst: true
+  burst_rate: 0.10
+  burst_intensity: 0.45      # capacity drops to 45% while bursting
+  burst_duration_s: 0.5
+  # Shared-bottleneck group: paths 4 and 5 degrade together.
+  corr_groups: [[4, 5]]
+  corr_rate: 0.05
+  corr_intensity: 0.50
+  corr_duration_s: 1.2
+
+sac:
+  hidden_dim: 256
+  gamma: 0.99
+  tau: 0.005
+  lr: 0.0003
+  batch_size: 256
+  buffer_size: 200000
+  start_steps: 1000
+  update_after: 1000
+  updates_per_step: 1
+  auto_entropy: true
+
+run:
+  episodes: 200
+  seed: 1
+  cap_mbps: 20.0             # generous normalizer (6 paths, regime up to 1.3x)
+  out_dir: "runs"
+  transport_arch: scoring    # the dynamic-input model this scenario is built for

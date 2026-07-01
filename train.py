@@ -22,6 +22,11 @@ def main() -> None:
     p.add_argument("--episodes", type=int, default=None, help="override config episodes")
     p.add_argument("--seed", type=int, default=None, help="override base seed")
     p.add_argument("--out-dir", default=None, help="run output directory")
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="reload latest checkpoints from --out-dir and continue training",
+    )
     p.add_argument("--show-output", action="store_true", help="stream NS-3 stdout/stderr")
     p.add_argument(
         "--learned-vmaf",
@@ -40,6 +45,7 @@ def main() -> None:
         out_dir=args.out_dir,
         show_output=args.show_output,
         use_learned_vmaf=args.learned_vmaf or None,
+        resume=args.resume,
     )
 
 

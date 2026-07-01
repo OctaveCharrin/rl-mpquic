@@ -17,6 +17,7 @@ import yaml
 
 from ..ns3env.dataplane import (
     DataPlane,
+    DynamicsConfig,
     MockRealtimeConfig,
     MockRealtimeDataPlane,
     Ns3Config,
@@ -65,6 +66,13 @@ class ExperimentConfig:
     seed: int = 1
     cap_mbps: float = 10.0
     out_dir: str = "runs"
+    # Transport-agent architecture: "flat" (legacy fixed-dim MLP SAC) or
+    # "scoring" (permutation-equivariant, variable-path-count SAC). "flat" is the
+    # default so existing configs/checkpoints are unaffected.
+    transport_arch: str = "flat"
+    # Optional non-stationary mock dynamics (None => fully static mock network).
+    # Ignored by the NS-3 backend.
+    dynamics: Optional[DynamicsConfig] = None
     # Use the WebRTC-grounded learned QoS->VMAF surrogate for the App reward's
     # quality term instead of the default bitrate-only log curve.
     use_learned_vmaf: bool = False
@@ -104,6 +112,7 @@ class ExperimentConfig:
             deadline_ms=self.deadline_ms,
             video=self.video,
             seed=seed if seed is not None else self.seed,
+            dynamics=self.dynamics,
         )
         return MockRealtimeDataPlane(cfg)
 
@@ -186,7 +195,40 @@ def load_config(path: Optional[str] = None) -> ExperimentConfig:
     cfg.seed = int(run.get("seed", 1))
     cfg.cap_mbps = float(run.get("cap_mbps", 10.0))
     cfg.out_dir = str(run.get("out_dir", "runs"))
+    cfg.transport_arch = str(run.get("transport_arch", sac.get("transport_arch", "flat")))
+
+    cfg.dynamics = _parse_dynamics(data.get("dynamics"))
     return cfg
+
+
+def _parse_dynamics(d: Optional[Dict[str, Any]]) -> Optional[DynamicsConfig]:
+    """Build a :class:`DynamicsConfig` from the optional ``dynamics:`` YAML block.
+
+    Returns None when the block is absent or ``enabled: false`` so the mock stays
+    fully static (legacy behavior). Unknown keys are ignored.
+    """
+    if not d or not bool(d.get("enabled", False)):
+        return None
+    groups = d.get("corr_groups", []) or []
+    return DynamicsConfig(
+        enabled=True,
+        churn=bool(d.get("churn", False)),
+        churn_up_rate=float(d.get("churn_up_rate", 0.10)),
+        churn_down_rate=float(d.get("churn_down_rate", 0.05)),
+        min_active=int(d.get("min_active", 1)),
+        regime=bool(d.get("regime", False)),
+        regime_rate=float(d.get("regime_rate", 0.20)),
+        regime_lo=float(d.get("regime_lo", 0.35)),
+        regime_hi=float(d.get("regime_hi", 1.30)),
+        burst=bool(d.get("burst", False)),
+        burst_rate=float(d.get("burst_rate", 0.15)),
+        burst_intensity=float(d.get("burst_intensity", 0.25)),
+        burst_duration_s=float(d.get("burst_duration_s", 0.5)),
+        corr_groups=[[int(x) for x in grp] for grp in groups],
+        corr_rate=float(d.get("corr_rate", 0.05)),
+        corr_intensity=float(d.get("corr_intensity", 0.30)),
+        corr_duration_s=float(d.get("corr_duration_s", 1.0)),
+    )
 
 
 def _DEFAULT_PATHS() -> List[Dict[str, Any]]:

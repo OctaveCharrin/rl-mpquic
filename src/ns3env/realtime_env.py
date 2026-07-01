@@ -37,10 +37,13 @@ from .qoe import (
 )
 from .video_source import VideoSourceConfig
 
-# Per-path transport feature count in the transport observation.
+# Per-path transport feature count in the (flat) transport observation.
 _PATH_FEATURES = 5
 # Global feature count prepended to the transport observation.
 _TRANSPORT_GLOBAL = 4
+# Per-path feature count in the *structured* (scoring) transport state: the five
+# flat per-path features plus the liveness flag.
+_PATH_FEATURES_SCORING = _PATH_FEATURES + 1
 # App observation feature count. The policy is horizon-agnostic: it sees only
 # sender-observable state, never how far through the episode it is (a real call
 # has unknown duration), and the fixed episode length is handled as a value
@@ -61,6 +64,23 @@ class StepInfo:
     loss: float
     bytes_delivered: int
     transport_reward: float
+
+
+@dataclass
+class TransportState:
+    """Structured (set-shaped) transport observation for the scoring agent.
+
+    Unlike the flat ``build_transport_obs`` vector, this keeps the per-path rows
+    *separate* so a permutation-equivariant policy can score a variable / changing
+    set of paths. ``glob`` is the same aggregate context the flat observation
+    prepends; ``paths`` is one row per candidate path; ``mask`` is the liveness
+    flag (1.0 = usable). Inactive rows are still present (fixed ``num_paths``
+    width) but masked out by the model.
+    """
+
+    glob: np.ndarray   # (G,)
+    paths: np.ndarray  # (N, F)
+    mask: np.ndarray   # (N,)  1.0 active / 0.0 churned-out
 
 
 class HierarchicalRealtimeEnv:
@@ -105,6 +125,16 @@ class HierarchicalRealtimeEnv:
     @property
     def transport_obs_dim(self) -> int:
         return _TRANSPORT_GLOBAL + _PATH_FEATURES * self.num_paths
+
+    @property
+    def transport_global_dim(self) -> int:
+        """Global-context width for the scoring (structured) transport state."""
+        return _TRANSPORT_GLOBAL
+
+    @property
+    def transport_path_dim(self) -> int:
+        """Per-path feature width for the scoring (structured) transport state."""
+        return _PATH_FEATURES_SCORING
 
     @property
     def transport_act_dim(self) -> int:
@@ -170,6 +200,45 @@ class HierarchicalRealtimeEnv:
                 ]
             )
         return np.array(feats, dtype=np.float32)
+
+    def build_transport_state(
+        self, obs: Optional[FrameObs] = None, target_bitrate_kbps: Optional[float] = None
+    ) -> TransportState:
+        """Structured transport observation for the scoring (dynamic-input) agent.
+
+        Same normalized features as :meth:`build_transport_obs`, but kept as a
+        ``(glob, paths, mask)`` triple so a permutation-equivariant policy can
+        handle a variable / changing path set. The per-path row carries the five
+        flat features plus the liveness flag; ``mask`` mirrors that flag (1.0 when
+        the path is usable). When the backend reports no ``path_active`` (static
+        network), every path is treated as live.
+        """
+        o = obs or self.obs
+        br = o.current_bitrate_kbps if target_bitrate_kbps is None else target_bitrate_kbps
+        glob = np.array(
+            [
+                self._bitrate_norm(br),
+                _clip(o.rtt_ms / self.weights.latency_norm_ms),
+                _clip(o.loss),
+                _clip(o.throughput_mbps / self.dp.cap_mbps),
+            ],
+            dtype=np.float32,
+        )
+        n = self.num_paths
+        paths = np.zeros((n, _PATH_FEATURES_SCORING), dtype=np.float32)
+        mask = np.ones(n, dtype=np.float32)
+        for i in range(n):
+            active = _at(o.path_active, i) if o.path_active else 1.0
+            mask[i] = 1.0 if active >= 0.5 else 0.0
+            paths[i] = [
+                _clip(_at(o.cwnd, i) / _CWND_NORM),
+                _clip(_at(o.srtt_ms, i) / self.weights.latency_norm_ms),
+                _clip(_at(o.buffer_occ, i) / _BUFFER_NORM),
+                _clip(_at(o.path_throughput_mbps, i) / self.dp.cap_mbps),
+                _clip(_at(o.path_loss, i)),
+                mask[i],
+            ]
+        return TransportState(glob=glob, paths=paths, mask=mask)
 
     # -- stepping ----------------------------------------------------------- #
 
