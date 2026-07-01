@@ -126,6 +126,8 @@ class ExperimentConfig:
             deadline_ms=self.deadline_ms,
             video=self.video,
             seed=seed if seed is not None else self.seed,
+            dynamics=self.dynamics,
+            topology=self.paths,
         )
         # Aggregate capacity cap ~ sum of nominal link rates (Mbps).
         cap = sum(parse_rate_mbps(p["rate"]) for p in self.paths) or self.cap_mbps

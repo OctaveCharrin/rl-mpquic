@@ -564,6 +564,41 @@ class Ns3Config:
     video: VideoSourceConfig = field(default_factory=VideoSourceConfig)
     seed: int = 1
 
+    # Optional non-stationary dynamics forwarded to the C++ body (None / disabled
+    # => the static NS-3 scenario, byte-identical to before). The same
+    # `DynamicsConfig` the mock consumes; the C++ mirrors churn/regime/burst and
+    # correlated failures, and emits the matching `pathActive[]` mask.
+    dynamics: Optional[DynamicsConfig] = None
+
+    # Optional per-path topology (list of {rate, delay, cross_frac} dicts). When
+    # given it replaces the C++ scenario's hardcoded default path list, so a YAML
+    # like configs/dynamic.yaml drives the same path count on both backends (and
+    # its corr_groups indices become in-range). None => C++ default topology.
+    topology: Optional[Sequence[dict]] = None
+
+
+def _encode_topology(paths: Sequence[dict]) -> str:
+    """Serialize the topology for the NS-3 CLI (shell-safe).
+
+    Paths are separated by ':' and the ``rate,delay,cross_frac`` fields within a
+    path by ',', e.g. ``"3Mbps,10ms,0.4:2Mbps,20ms,0.55"``. Rate/delay tokens are
+    alphanumeric and cross_frac is a plain decimal, so no shell metacharacters
+    appear (the setting dict is spliced into a ``shell=True`` command line).
+    """
+    return ":".join(
+        f"{p['rate']},{p['delay']},{float(p.get('cross_frac', 0.4))}" for p in paths
+    )
+
+
+def _encode_corr_groups(groups: Sequence[Sequence[int]]) -> str:
+    """Serialize correlated-failure groups for the NS-3 CLI (shell-safe).
+
+    Groups are separated by ':' and member indices within a group by ',', e.g.
+    ``[[4, 5], [0, 1]]`` -> ``"4,5:0,1"``. Avoids shell metacharacters (';', '|')
+    since the setting dict is spliced into a ``shell=True`` command line.
+    """
+    return ":".join(",".join(str(int(x)) for x in grp) for grp in groups if len(grp))
+
 
 class Ns3DataPlane(DataPlane):
     """Drives the real NS-3 ``realtime_mpquic`` scenario via the ns3-ai bridge.
@@ -667,6 +702,31 @@ class Ns3DataPlane(DataPlane):
                 "maxBitrateKbps": self.config.video.max_bitrate_kbps,
                 "seed": max(1, int(self.config.seed)),  # NS-3 rejects seed 0
             }
+            if self.config.topology:
+                setting["paths"] = _encode_topology(self.config.topology)
+            d = self.config.dynamics
+            if d is not None and d.enabled:
+                setting["dynamicsEnabled"] = 1
+                setting["churn"] = 1 if d.churn else 0
+                setting["churnUpRate"] = d.churn_up_rate
+                setting["churnDownRate"] = d.churn_down_rate
+                setting["minActive"] = int(d.min_active)
+                setting["regime"] = 1 if d.regime else 0
+                setting["regimeRate"] = d.regime_rate
+                setting["regimeLo"] = d.regime_lo
+                setting["regimeHi"] = d.regime_hi
+                setting["burst"] = 1 if d.burst else 0
+                setting["burstRate"] = d.burst_rate
+                setting["burstIntensity"] = d.burst_intensity
+                setting["burstDurationS"] = d.burst_duration_s
+                setting["corrRate"] = d.corr_rate
+                setting["corrIntensity"] = d.corr_intensity
+                setting["corrDurationS"] = d.corr_duration_s
+                corr = _encode_corr_groups(d.corr_groups)
+                if corr:
+                    setting["corrGroups"] = corr
+            else:
+                setting["dynamicsEnabled"] = 0
             self._msg = self._exp.run(setting=setting, show_output=self.show_output)
         finally:
             os.chdir(cwd)
@@ -714,9 +774,9 @@ class Ns3DataPlane(DataPlane):
             buffer_occ=[float(e.bufferOcc(i)) for i in range(n)],
             path_throughput_mbps=[float(e.pathThroughput(i)) for i in range(n)],
             path_loss=[float(e.pathLoss(i)) for i in range(n)],
-            # CONTRACT: until EnvStruct grows a pathActive[] field, the C++ body
-            # has no churn, so every reported path is live.
-            path_active=[1.0] * n,
+            # Per-path liveness mask emitted by the C++ body's churn machine
+            # (all-ones when dynamics are disabled). See EnvStruct.pathActive[].
+            path_active=[float(e.pathActive(i)) for i in range(n)],
             last_latency_ms=float(e.lastLatencyMs),
             last_jitter_ms=float(e.lastJitterMs),
             last_loss=float(e.lastLoss),

@@ -63,10 +63,20 @@ the full system; on the dynamic scenario the same App-only ablation *collapses*)
   (legacy fixed-dim MLP) is the default. Checkpoints are arch-tagged; eval/`resume`
   read the tag. `configs/dynamic.yaml` is the headline scenario.
 
-**CONTRACT:** the NS-3 body does *not* yet emit churn/regime/burst dynamics or a
-`pathActive[]` field — `Ns3DataPlane` fills `path_active` all-ones. Porting the
-dynamics into `ns3/realtime_mpquic.{h,cc}` (add `EnvStruct.pathActive[kMaxPaths]`)
-is the pending follow-up; keep the mock and C++ in sync when it lands.
+**CONTRACT:** the NS-3 body now mirrors these dynamics. `EnvStruct.pathActive[kMaxPaths]`
+carries the liveness mask (bound as `e.pathActive(i)`), and `RealtimeController`
+implements churn/regime/burst/correlated failures off the same `DynamicsConfig`
+parameters (forwarded via the `setting` dict → C++ CLI; **off by default** so the
+static NS-3 scenario is byte-identical). Churn collapses the NS-3 link and drops
+app bytes routed onto a dead path (loss); regime/burst/corr scale the per-path
+bottleneck `DataRate`. Keep the mock and C++ in sync when either side changes.
+The `topology:` path list is forwarded too (`Ns3Config.topology` → `paths` CLI
+arg), so a YAML like `configs/dynamic.yaml` drives the same 6-path count on both
+backends and its `corr_groups: [[4,5]]` is in-range under `--backend ns3` (an
+empty `paths` arg keeps the C++ built-in default topology). Approximation vs. the
+mock: the two backends draw from different RNG streams, so they are behaviorally
+equivalent but *not* frame-identical, and per-path throughput/RTT evolve through
+NS-3's real transport rather than the mock's analytical queue.
 
 ## Dev loop
 

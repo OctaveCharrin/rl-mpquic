@@ -39,7 +39,12 @@
 #include "ns3/traffic-control-module.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <deque>
+#include <set>
+#include <sstream>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -278,6 +283,32 @@ struct ScenarioConfig
     uint32_t keyframeInterval = 30;
     uint32_t seed = 1;
     uint16_t basePort = 5000;
+
+    // --- Optional non-stationary dynamics (mirrors DynamicsConfig in Python) --//
+    // All OFF by default so the static scenario reproduces byte-for-byte: when
+    // disabled the dynamics RNG is never drawn and per-path link rates are left
+    // at their nominal values. Rates are per-second hazards, applied per frame
+    // via 1 - exp(-rate*dt) exactly like the mock.
+    bool dynamicsEnabled = false;
+    bool churn = false;
+    double churnUpRate = 0.10;   // down -> up hazard
+    double churnDownRate = 0.05; // up -> down hazard
+    uint32_t minActive = 1;      // floor on the live-path count
+    bool regime = false;
+    double regimeRate = 0.20; // change-points/s/path
+    double regimeLo = 0.35;
+    double regimeHi = 1.30;
+    bool burst = false;
+    double burstRate = 0.15;
+    double burstIntensity = 0.25;
+    double burstDurationS = 0.5;
+    double corrRate = 0.05;
+    double corrIntensity = 0.30;
+    double corrDurationS = 1.0;
+    // Correlated-failure groups, ':'-separated groups of ','-separated indices,
+    // e.g. "4,5:0,1". Indices >= numPaths are dropped (this topology has 4
+    // paths, so a 6-path config's out-of-range group is simply inactive).
+    std::string corrGroups = "";
 };
 
 // --------------------------------------------------------------------------- //
@@ -310,6 +341,9 @@ class RealtimeController
         m_pathLossCache.assign(n, 0.0);
         m_curSplit.assign(n, 1.0 / n);
         m_curBitrateKbps = m_cfg.initBitrateKbps;
+        m_devs.resize(n);
+        m_baseRate.resize(n);
+        m_baseRttMs.assign(n, 0.0);
 
         Ipv4AddressHelper addr;
         for (uint32_t i = 0; i < n; ++i)
@@ -318,6 +352,11 @@ class RealtimeController
             p2p.SetDeviceAttribute("DataRate", StringValue(m_cfg.paths[i].rate));
             p2p.SetChannelAttribute("Delay", StringValue(m_cfg.paths[i].delay));
             NetDeviceContainer dev = p2p.Install(m_client.Get(0), m_server.Get(0));
+            m_devs[i] = dev;
+            m_baseRate[i] = DataRate(m_cfg.paths[i].rate);
+            // Base RTT ~ 2 x one-way propagation delay (ms); a neutral sRTT
+            // placeholder reported for churned-out paths (mirrors the mock).
+            m_baseRttMs[i] = 2.0 * Time(m_cfg.paths[i].delay).GetSeconds() * 1000.0;
 
             // Per-path AQM so loss + queueing delay emerge under load.
             TrafficControlHelper tch;
@@ -344,6 +383,8 @@ class RealtimeController
         // m_fmh is a member so the monitor outlives Simulator::Run().
         m_monitor = m_fmh.InstallAll();
         m_classifier = DynamicCast<Ipv4FlowClassifier>(m_fmh.GetClassifier());
+
+        InitDynamics();
     }
 
     void AttachInterface(Ns3AiMsgInterfaceImpl<EnvStruct, ActStruct>* msg) { m_msg = msg; }
@@ -372,6 +413,7 @@ class RealtimeController
         double genTimeS;
         double completeTimeS;
         uint64_t bytes;
+        uint64_t droppedBytes; // bytes routed onto churned-out paths (lost)
     };
 
     uint32_t FramesPerEpisode() const
@@ -427,6 +469,164 @@ class RealtimeController
         ApplicationContainer co = onoff.Install(m_server.Get(0));
         co.Start(Seconds(0.2));
         m_crossApps.Add(co);
+    }
+
+    // -- non-stationary dynamics ------------------------------------------- //
+    // Mirror MockRealtimeDataPlane's churn/regime/burst/correlated-failure
+    // machines (src/ns3env/dataplane.py). Everything is a no-op when
+    // `dynamicsEnabled` is false, so the static scenario is byte-identical and
+    // the dynamics RNG is never drawn.
+
+    bool PathLive(uint32_t i) const { return m_active[i] != 0; }
+
+    // Parse "4,5:0,1" into index sets (dropping out-of-range members: this
+    // topology has NumPaths() paths, so a larger config's group is inactive).
+    void InitDynamics()
+    {
+        const uint32_t n = NumPaths();
+        m_active.assign(n, 1);
+        m_regimeMult.assign(n, 1.0);
+        m_burstUntil.assign(n, -1.0);
+        m_corrMembers.clear();
+        m_corrUntil.clear();
+        if (!m_cfg.dynamicsEnabled)
+        {
+            return;
+        }
+        std::stringstream gs(m_cfg.corrGroups);
+        std::string grp;
+        while (std::getline(gs, grp, ':'))
+        {
+            std::set<uint32_t> members;
+            std::stringstream is(grp);
+            std::string idx;
+            while (std::getline(is, idx, ','))
+            {
+                if (idx.empty()) continue;
+                long v = std::strtol(idx.c_str(), nullptr, 10);
+                if (v >= 0 && v < static_cast<long>(n)) members.insert(static_cast<uint32_t>(v));
+            }
+            if (!members.empty()) m_corrMembers.push_back(members);
+        }
+        ResetDynamicsState();
+    }
+
+    // Fresh-episode dynamic state: all paths live, regime multipliers resampled,
+    // burst/correlation timers cleared. Continues the RNG stream across episodes
+    // (like the mock's reset with seed=None) so runs stay deterministic per seed.
+    void ResetDynamicsState()
+    {
+        const uint32_t n = NumPaths();
+        std::fill(m_active.begin(), m_active.end(), 1);
+        std::fill(m_burstUntil.begin(), m_burstUntil.end(), -1.0);
+        std::fill(m_corrUntil.begin(), m_corrUntil.end(), -1.0);
+        m_corrUntil.assign(m_corrMembers.size(), -1.0);
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            m_regimeMult[i] = m_cfg.regime
+                                  ? m_dynRng->GetValue(m_cfg.regimeLo, m_cfg.regimeHi)
+                                  : 1.0;
+        }
+        for (uint32_t i = 0; i < n; ++i) ApplyPathRate(i);
+    }
+
+    // Current dynamic capacity multiplier for path i (regime x burst x corr),
+    // 1.0 when disabled. Mirrors MockRealtimeDataPlane._cap_mult.
+    double CapMult(uint32_t i) const
+    {
+        if (!m_cfg.dynamicsEnabled) return 1.0;
+        double m = m_regimeMult[i];
+        double now = Simulator::Now().GetSeconds();
+        if (m_burstUntil[i] > now) m *= m_cfg.burstIntensity;
+        for (size_t g = 0; g < m_corrMembers.size(); ++g)
+        {
+            if (m_corrUntil[g] > now && m_corrMembers[g].count(i)) m *= m_cfg.corrIntensity;
+        }
+        return m;
+    }
+
+    // Push the current effective capacity onto the NS-3 bottleneck. A churned-out
+    // path collapses to ~0 so its throughput/RTT reflect the outage; its bytes
+    // are additionally dropped at the app layer in GenerateFrame.
+    void ApplyPathRate(uint32_t i)
+    {
+        if (!m_cfg.dynamicsEnabled) return;
+        double mult = PathLive(i) ? CapMult(i) : 1e-4;
+        uint64_t bps =
+            static_cast<uint64_t>(std::max(1e3, m_baseRate[i].GetBitRate() * mult));
+        DataRateValue drv{DataRate(bps)};
+        m_devs[i].Get(0)->SetAttribute("DataRate", drv);
+        m_devs[i].Get(1)->SetAttribute("DataRate", drv);
+    }
+
+    // Step the machines one frame. Event probabilities convert per-second hazards
+    // over one frame via 1 - exp(-rate*dt); draw order (regime, burst, corr,
+    // churn) matches the mock for parity of behavior.
+    void AdvanceDynamics()
+    {
+        if (!m_cfg.dynamicsEnabled) return;
+        const uint32_t n = NumPaths();
+        const double t = Simulator::Now().GetSeconds();
+        const double dt = 1.0 / m_cfg.fps;
+
+        if (m_cfg.regime)
+        {
+            double p = 1.0 - std::exp(-m_cfg.regimeRate * dt);
+            for (uint32_t i = 0; i < n; ++i)
+                if (m_dynRng->GetValue(0.0, 1.0) < p)
+                    m_regimeMult[i] = m_dynRng->GetValue(m_cfg.regimeLo, m_cfg.regimeHi);
+        }
+        if (m_cfg.burst)
+        {
+            double p = 1.0 - std::exp(-m_cfg.burstRate * dt);
+            for (uint32_t i = 0; i < n; ++i)
+                if (m_dynRng->GetValue(0.0, 1.0) < p)
+                    m_burstUntil[i] = t + m_cfg.burstDurationS;
+        }
+        if (!m_corrMembers.empty())
+        {
+            double p = 1.0 - std::exp(-m_cfg.corrRate * dt);
+            for (size_t g = 0; g < m_corrMembers.size(); ++g)
+                if (m_dynRng->GetValue(0.0, 1.0) < p)
+                    m_corrUntil[g] = t + m_cfg.corrDurationS;
+        }
+        if (m_cfg.churn)
+        {
+            double pUp = 1.0 - std::exp(-m_cfg.churnUpRate * dt);
+            double pDown = 1.0 - std::exp(-m_cfg.churnDownRate * dt);
+            std::vector<uint8_t> nxt = m_active;
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                if (m_active[i])
+                {
+                    if (m_dynRng->GetValue(0.0, 1.0) < pDown) nxt[i] = 0;
+                }
+                else if (m_dynRng->GetValue(0.0, 1.0) < pUp)
+                {
+                    nxt[i] = 1;
+                }
+            }
+            // Never let the live set fall below minActive (bring lowest idx up).
+            uint32_t live = 0;
+            for (auto v : nxt) live += v;
+            for (uint32_t i = 0; i < n && live < m_cfg.minActive; ++i)
+                if (!nxt[i]) { nxt[i] = 1; ++live; }
+            m_active = nxt;
+        }
+        // Reflect the updated multipliers/liveness on the links for the next frame.
+        for (uint32_t i = 0; i < n; ++i) ApplyPathRate(i);
+    }
+
+    // Register a whole-frame loss (all shares routed onto dead/empty paths), the
+    // C++ analogue of the mock's "frame on dead paths -> deadline miss".
+    void RegisterLostFrame(double now)
+    {
+        (void)now;
+        m_appLossEwma = 0.9 * m_appLossEwma + 0.1 * 1.0;
+        m_lastLatencyMs = 2.0 * m_cfg.deadlineMs;
+        m_lastJitterMs = 0.0;
+        m_lastLoss = 1.0;
+        m_lastBytes = 0;
     }
 
     // -- decision loop ------------------------------------------------------ //
@@ -486,6 +686,9 @@ class RealtimeController
 
         GenerateFrame(act, now);
         ++m_frameInEpisode;
+        // Advance the dynamic state so the next frame's delivery + observation
+        // share it (mirrors the mock, which advances after each step_frame).
+        AdvanceDynamics();
         Simulator::Schedule(Seconds(1.0 / m_cfg.fps), &RealtimeController::Decide, this);
     }
 
@@ -543,17 +746,31 @@ class RealtimeController
 
         const uint64_t fId = m_frameTotal++;
         uint32_t activeShares = 0;
+        uint64_t droppedBytes = 0;
         for (uint32_t i = 0; i < n; ++i)
         {
             if (shares[i] == 0) continue;
+            if (m_cfg.dynamicsEnabled && !PathLive(i))
+            {
+                // Bytes routed onto a churned-out path never arrive: count them
+                // as loss (the penalty that teaches respect for the mask).
+                droppedBytes += shares[i];
+                m_pathLossCache[i] = 1.0;
+                continue;
+            }
             ++activeShares;
             m_pathEnq[i] += shares[i];
             m_shareQ[i].push_back(ShareEntry{m_pathEnq[i], fId, shares[i]});
             m_sources[i]->Enqueue(shares[i]);
         }
-        if (activeShares == 0) return; // nothing to deliver this frame
+        if (activeShares == 0)
+        {
+            // Whole frame routed onto dead (or empty) paths: an immediate loss.
+            RegisterLostFrame(now);
+            return;
+        }
 
-        m_frames[fId] = FrameRec{activeShares, now, now, frameBytes};
+        m_frames[fId] = FrameRec{activeShares, now, now, frameBytes, droppedBytes};
         m_pendingFrames.push_back(fId);
     }
 
@@ -596,19 +813,27 @@ class RealtimeController
         double jitterMs = (m_prevLatencyMs >= 0.0) ? std::abs(latencyMs - m_prevLatencyMs) : 0.0;
         m_prevLatencyMs = latencyMs;
 
+        // Partial loss from bytes shed onto churned-out paths (mirrors the mock's
+        // dropped_frac): app loss = max(deadline-miss, dropped fraction).
+        double droppedFrac = (fr.bytes > 0)
+                                 ? static_cast<double>(fr.droppedBytes) / static_cast<double>(fr.bytes)
+                                 : 0.0;
+        double frameLoss = std::min(1.0, std::max(late ? 1.0 : 0.0, droppedFrac));
+        uint64_t delivered = late ? 0 : (fr.bytes - fr.droppedBytes);
+
         double goodputMbps = (fr.bytes * 8.0) / (std::max(latencyMs / 1000.0, 1e-6) * 1e6);
 
         // Episode EWMAs feeding the aggregate observation.
         m_jitterEwma = 0.7 * m_jitterEwma + 0.3 * jitterMs;
-        m_appLossEwma = 0.9 * m_appLossEwma + 0.1 * (late ? 1.0 : 0.0);
+        m_appLossEwma = 0.9 * m_appLossEwma + 0.1 * frameLoss;
         m_thrEwma = 0.7 * m_thrEwma + 0.3 * goodputMbps;
         m_rttEwma = (m_rttEwma <= 0.0) ? latencyMs : 0.8 * m_rttEwma + 0.2 * latencyMs;
 
         // Most-recently-completed frame result.
         m_lastLatencyMs = latencyMs;
         m_lastJitterMs = jitterMs;
-        m_lastLoss = late ? 1.0 : 0.0;
-        m_lastBytes = static_cast<uint32_t>(fr.bytes);
+        m_lastLoss = frameLoss;
+        m_lastBytes = static_cast<uint32_t>(delivered);
 
         m_frames.erase(it);
     }
@@ -660,12 +885,28 @@ class RealtimeController
         double wsum = 0.0;
         for (uint32_t i = 0; i < n; ++i)
         {
-            double s = m_sources[i]->GetSrttMs();
-            env.cwnd[i] = m_sources[i]->GetCwnd();
+            bool live = !m_cfg.dynamicsEnabled || PathLive(i);
+            env.pathActive[i] = live ? 1 : 0;
+            double s;
+            if (live)
+            {
+                s = m_sources[i]->GetSrttMs();
+                env.cwnd[i] = m_sources[i]->GetCwnd();
+                env.bufferOcc[i] = m_sources[i]->GetBufferOcc();
+                env.pathThroughputMbps[i] = m_pathThrEwma[i];
+                env.pathLoss[i] = m_pathLossCache[i];
+            }
+            else
+            {
+                // Churned-out path reports dead state; the mask lets the policy
+                // exclude it. Neutral base RTT placeholder (masked downstream).
+                s = m_baseRttMs[i];
+                env.cwnd[i] = 0.0;
+                env.bufferOcc[i] = 0.0;
+                env.pathThroughputMbps[i] = 0.0;
+                env.pathLoss[i] = 1.0;
+            }
             env.srttMs[i] = s;
-            env.bufferOcc[i] = m_sources[i]->GetBufferOcc();
-            env.pathThroughputMbps[i] = m_pathThrEwma[i];
-            env.pathLoss[i] = m_pathLossCache[i];
             rttW += m_curSplit[i] * s;
             wsum += m_curSplit[i];
         }
@@ -730,6 +971,12 @@ class RealtimeController
         m_lastJitterMs = 0.0;
         m_lastLoss = 0.0;
         m_lastBytes = 0;
+
+        // Fresh episode: all paths live again, regime multipliers resampled.
+        if (m_cfg.dynamicsEnabled)
+        {
+            ResetDynamicsState();
+        }
     }
 
     ScenarioConfig m_cfg;
@@ -739,6 +986,18 @@ class RealtimeController
     std::vector<Ptr<RealtimeSink>> m_sinks;
     std::vector<Ipv4Address> m_clientAddr;
     ApplicationContainer m_crossApps;
+
+    // Per-path link handles + baselines for the dynamics machinery.
+    std::vector<NetDeviceContainer> m_devs;
+    std::vector<DataRate> m_baseRate;
+    std::vector<double> m_baseRttMs;
+
+    // Non-stationary dynamics state (mirrors MockRealtimeDataPlane).
+    std::vector<uint8_t> m_active;             // per-path liveness (churn)
+    std::vector<double> m_regimeMult;          // per-path regime multiplier
+    std::vector<double> m_burstUntil;          // per-path burst end time (s)
+    std::vector<std::set<uint32_t>> m_corrMembers; // correlated-failure groups
+    std::vector<double> m_corrUntil;           // per-group failure end time (s)
 
     // Frame delivery bookkeeping.
     std::vector<uint64_t> m_pathEnq;             // cumulative bytes pushed per path
@@ -770,16 +1029,44 @@ class RealtimeController
     Ptr<Ipv4FlowClassifier> m_classifier;
     Ns3AiMsgInterfaceImpl<EnvStruct, ActStruct>* m_msg = nullptr;
     Ptr<UniformRandomVariable> m_uniform = CreateObject<UniformRandomVariable>();
+    // Dedicated RNG stream for dynamics so frame-size jitter is unperturbed.
+    Ptr<UniformRandomVariable> m_dynRng = CreateObject<UniformRandomVariable>();
     bool m_selftest = false;
 };
 
 // --------------------------------------------------------------------------- //
+
+// Parse a topology string ("rate,delay,cross:rate,delay,cross:...") from the CLI
+// into PathLink entries. Mirrors _encode_topology in src/ns3env/dataplane.py.
+static std::vector<PathLink>
+ParsePaths(const std::string& s)
+{
+    std::vector<PathLink> out;
+    std::stringstream ps(s);
+    std::string tok;
+    while (std::getline(ps, tok, ':'))
+    {
+        if (tok.empty()) continue;
+        std::stringstream fs(tok);
+        std::string rate, delay, cross;
+        std::getline(fs, rate, ',');
+        std::getline(fs, delay, ',');
+        std::getline(fs, cross, ',');
+        PathLink pl;
+        pl.rate = rate;
+        pl.delay = delay;
+        pl.crossFrac = cross.empty() ? 0.4 : std::strtod(cross.c_str(), nullptr);
+        out.push_back(pl);
+    }
+    return out;
+}
 
 int
 main(int argc, char* argv[])
 {
     ScenarioConfig cfg;
     bool selftest = false;
+    std::string topology = ""; // empty => keep the hardcoded default path list
 
     CommandLine cmd;
     cmd.AddValue("fps", "Video frames per second", cfg.fps);
@@ -792,7 +1079,35 @@ main(int argc, char* argv[])
     cmd.AddValue("seed", "RNG seed", cfg.seed);
     cmd.AddValue("selftest", "Run a self-contained even-split episode without the bridge",
                  selftest);
+    cmd.AddValue("paths", "Topology: rate,delay,cross:... (empty => built-in default)", topology);
+    // Non-stationary dynamics (default OFF -> static scenario unchanged).
+    cmd.AddValue("dynamicsEnabled", "Enable non-stationary path dynamics", cfg.dynamicsEnabled);
+    cmd.AddValue("churn", "Enable path churn (appear/disappear)", cfg.churn);
+    cmd.AddValue("churnUpRate", "Churn down->up hazard (per s)", cfg.churnUpRate);
+    cmd.AddValue("churnDownRate", "Churn up->down hazard (per s)", cfg.churnDownRate);
+    cmd.AddValue("minActive", "Floor on the number of live paths", cfg.minActive);
+    cmd.AddValue("regime", "Enable regime shifts (best-path swaps)", cfg.regime);
+    cmd.AddValue("regimeRate", "Regime change-points (per s per path)", cfg.regimeRate);
+    cmd.AddValue("regimeLo", "Regime capacity multiplier lower bound", cfg.regimeLo);
+    cmd.AddValue("regimeHi", "Regime capacity multiplier upper bound", cfg.regimeHi);
+    cmd.AddValue("burst", "Enable congestion bursts", cfg.burst);
+    cmd.AddValue("burstRate", "Bursts (per s per path)", cfg.burstRate);
+    cmd.AddValue("burstIntensity", "Capacity multiplier while bursting", cfg.burstIntensity);
+    cmd.AddValue("burstDurationS", "Burst duration (s)", cfg.burstDurationS);
+    cmd.AddValue("corrRate", "Correlated-failure events (per s per group)", cfg.corrRate);
+    cmd.AddValue("corrIntensity", "Capacity multiplier for a failed group", cfg.corrIntensity);
+    cmd.AddValue("corrDurationS", "Correlated-failure duration (s)", cfg.corrDurationS);
+    cmd.AddValue("corrGroups", "Correlated groups, e.g. \"4,5:0,1\"", cfg.corrGroups);
     cmd.Parse(argc, argv);
+
+    if (!topology.empty())
+    {
+        std::vector<PathLink> parsed = ParsePaths(topology);
+        if (!parsed.empty())
+        {
+            cfg.paths = parsed;
+        }
+    }
 
     RngSeedManager::SetSeed(cfg.seed);
 

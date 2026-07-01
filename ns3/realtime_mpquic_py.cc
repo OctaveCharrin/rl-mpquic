@@ -38,7 +38,8 @@ PYBIND11_MODULE(ns3ai_realtime_mpquic_py, m)
         .def("srtt", [](EnvStruct& e, uint32_t i) { return e.srttMs[i]; })
         .def("bufferOcc", [](EnvStruct& e, uint32_t i) { return e.bufferOcc[i]; })
         .def("pathThroughput", [](EnvStruct& e, uint32_t i) { return e.pathThroughputMbps[i]; })
-        .def("pathLoss", [](EnvStruct& e, uint32_t i) { return e.pathLoss[i]; });
+        .def("pathLoss", [](EnvStruct& e, uint32_t i) { return e.pathLoss[i]; })
+        .def("pathActive", [](EnvStruct& e, uint32_t i) { return e.pathActive[i]; });
 
     py::class_<ActStruct>(m, "PyActStruct")
         .def(py::init<>())

@@ -168,10 +168,15 @@ canonical NS-3 scenario uses `N = 4`). For each path `i`:
   (a persistent TCP sender) and a client-side **`RealtimeSink`** (a receiver),
   forming one long-lived TCP connection — the "subflow."
 
-The topology is hardcoded in the C++ `ScenarioConfig` and mirrored for the mock
-backend / observation normalization by `configs/four_path.yaml` (`cap_mbps = 12`,
-raw total ~10.5 Mbps). The repo's `configs/default.yaml` retains the legacy
-3-path topology for quick mock-only experiments, but the NS-3 body is 4-path.
+The C++ `ScenarioConfig` carries a **built-in default** 4-path topology, but
+`Ns3DataPlane` now forwards the YAML `topology:` block to the body (serialized as
+a `paths` CLI argument), so the config drives the path list on *both* backends; an
+empty argument keeps the built-in default. `configs/four_path.yaml` encodes
+exactly the built-in default (`cap_mbps = 12`, raw total ~10.5 Mbps), so it
+reproduces the historical NS-3 scenario byte-for-byte, while `configs/dynamic.yaml`
+drives a 6-path set (§5.3.1). The repo's `configs/default.yaml` retains the legacy
+3-path topology for quick mock-only experiments; it now also runs as 3 paths on
+NS-3 (previously the body ignored the YAML and always built its 4-path default).
 
 A subflow is thus a stock single-path NS-3 TCP connection (`TcpSocketFactory`,
 the build's default congestion control). The "multipath QUIC" property lives one
@@ -345,6 +350,7 @@ struct-based shared-memory interface.
 | `currentBitrateKbps` | bitrate currently in effect |
 | `rttMs`, `jitterMs`, `loss`, `throughputMbps` | aggregate app-level state (split-weighted RTT; jitter, deadline-loss and goodput EWMAs) |
 | `cwnd[]`, `srttMs[]`, `bufferOcc[]`, `pathThroughputMbps[]`, `pathLoss[]` | per-path transport state (length `numPaths`) |
+| `pathActive[]` | per-path liveness mask (length `numPaths`): `1` = live, `0` = churned out. All-ones when dynamics are off (§3.9) |
 | `lastLatencyMs`, `lastJitterMs`, `lastLoss`, `lastBytes` | realized result of the most-recently-completed frame |
 
 **`ActStruct` (Python → C++), what the agents control:**
@@ -354,6 +360,45 @@ struct-based shared-memory interface.
 | `command` | `ACT_STEP` / `ACT_RESET` / `ACT_TERMINATE` |
 | `targetBitrateKbps` | App action — encoder target, **persists** across frames |
 | `splitRatio[]` | Transport action — per-path fractions for the next frame |
+
+### 3.9 Non-stationary dynamics in the body (optional)
+
+The body now mirrors the mock's four non-stationary mechanisms (§5.3.1), so
+`--backend ns3` can exercise the same variable-active-path scenario the mock does
+and a policy sees one observation contract on either backend. Everything is **off
+by default** (`dynamicsEnabled = 0`): when disabled the dynamics RNG is never
+drawn and per-path link rates stay at their nominal values, so the static NS-3
+scenario is byte-identical to before and `pathActive[]` is reported all-ones.
+
+The parameters are the same `DynamicsConfig` the mock consumes, forwarded from
+Python into the C++ CLI (§5.2) and parsed into `ScenarioConfig`. `RealtimeController`
+runs the four state machines once per frame (event probability `1 − e^{−rate·Δt}`,
+same draw order as the mock — regime, burst, correlation, churn), from a
+**dedicated NS-3 RNG stream** seeded by the scenario `seed` so the frame-size
+jitter stream is unperturbed and runs stay deterministic per seed:
+
+- **Churn.** A per-path on/off Markov chain (floored at `minActive`). A churned-out
+  path collapses its NS-3 link (`DataRate → ~0`) *and* has any bytes the scheduler
+  routes onto it dropped at the app layer and counted as loss — the same penalty
+  the mock applies (`CompleteFrame` folds the dropped fraction into the frame's
+  loss; a whole-frame-on-dead-paths is an immediate deadline miss). It reports a
+  dead per-path row and `pathActive = 0`.
+- **Regime / burst / correlated failures.** These scale the per-path bottleneck
+  `DataRate` by the same multiplier logic as the mock's `_cap_mult`
+  (`regime_mult × burst_mult × corr_mult`), reapplied to the live NS-3 devices each
+  frame, so per-path throughput/RTT reflect the shift/collapse.
+
+Episodes reset the dynamic state in-band (all paths live again, regime multipliers
+resampled) alongside the existing counter/EWMA reset (§3.7).
+
+**Where the body only approximates the mock.** (i) The two backends draw from
+independent RNG streams, so they are *behaviorally* equivalent but **not**
+frame-identical. (ii) Per-path throughput/RTT evolve through NS-3's real transport
+(TCP over the modulated bottleneck) rather than the mock's analytical standing
+queue, so aggregate magnitudes differ even when the dynamics match. (iii)
+Correlated-failure group indices `≥` the topology's path count are dropped — a
+non-issue now that the topology is forwarded (§3.1), so `configs/dynamic.yaml`'s
+`corr_groups: [[4, 5]]` is in-range on the 6-path NS-3 set.
 
 ---
 
@@ -436,11 +481,13 @@ realized result* (its `last_*` fields), with the next observation available via
 
 A thin marshaller over §4: it imports the pybind `.so`, launches the process,
 forwards episode parameters (fps, episode length, app period, deadline, bitrate
-bounds, seed) as CLI flags, and translates between `FrameObs`/`FrameResult` and
-the shared structs. `reset` either launches the process (first call) or issues an
-in-band `ACT_RESET`. `step_frame` normalizes the split, writes `ACT_STEP +
-targetBitrate + split`, receives the next `EnvStruct`, and returns its `last_*`
-fields as a `FrameResult`.
+bounds, seed), the `topology:` path list, and — when enabled — the `dynamics:`
+parameters (§3.9) as CLI flags, and translates between `FrameObs`/`FrameResult`
+and the shared structs (including reading the per-path liveness mask from
+`EnvStruct.pathActive[]` into `FrameObs.path_active`). `reset` either launches the
+process (first call) or issues an in-band `ACT_RESET`. `step_frame` normalizes the
+split, writes `ACT_STEP + targetBitrate + split`, receives the next `EnvStruct`,
+and returns its `last_*` fields as a `FrameResult`.
 
 ### 5.3 `MockRealtimeDataPlane`
 
@@ -467,8 +514,8 @@ moves, so the optimal split is nearly constant and a learned scheduler can win
 almost nothing over a fixed/heuristic split (see §11 — on the static topology the
 App-only ablation reaches ~98 % of the full system's QoE). To make *which path to
 send on* a genuinely informative, time-varying decision, the mock supports an
-optional `DynamicsConfig` (`configs/dynamic.yaml`; the NS-3 body has no equivalent
-yet — see the CONTRACT note in §3.8 and §11). It is **off by default**: when
+optional `DynamicsConfig` (`configs/dynamic.yaml`); the NS-3 body now mirrors the
+same four mechanisms (§3.9). It is **off by default**: when
 disabled the dynamic RNG is never drawn, so the static behavior — and its exact
 per-seed draw sequence — is unchanged. Four mechanisms, all deterministic per
 seed and advanced one step per frame (event probability `1 − e^{−rate·Δt}` over a
@@ -493,10 +540,10 @@ frame interval):
   diversification across a shared bottleneck does not help.
 
 The effective per-path capacity is `envelope × regime_mult × burst_mult ×
-corr_mult` (all 1.0 when static). A new `path_active` field on `FrameObs` mirrors
-`EnvStruct.pathActive[]` (which the NS-3 backend fills all-ones until C++ churn
-lands). Delivery folds the fraction of bytes routed onto dead paths into the
-frame's loss, so misrouting is graded, not silent.
+corr_mult` (all 1.0 when static). The `path_active` field on `FrameObs` mirrors
+`EnvStruct.pathActive[]`, which the NS-3 body now emits directly (§3.9; all-ones
+when dynamics are off). Delivery folds the fraction of bytes routed onto dead
+paths into the frame's loss, so misrouting is graded, not silent.
 
 Delivery uses a **standing-queue model** that reproduces bufferbloat. Each path
 keeps a `busy_until` serialization clock; delivering `b` bytes on path `i`:
@@ -977,12 +1024,13 @@ deliberate, and arguably correct, real-time framing, but not identical to an
 unreliable-datagram transport. (iii) *Reordering across paths:* the byte-watermark
 tracker measures per-path completion and aggregates to a frame; it does not model
 application-layer resequencing cost beyond the max-arrival latency. (iv)
-*Single client/server.* The mock backend optionally varies the *active* path count
-within a run via churn (§5.3.1), and the scoring Transport agent (§7.3.1) consumes
-that variable set; the **NS-3 body, however, still has a fixed `N` and no churn /
-regime / burst dynamics** — porting them into `realtime_mpquic.cc` (and adding
-`EnvStruct.pathActive[]`) is the natural follow-up the CONTRACT note in §3.8
-anticipates. (v) *Quality model:* the default VMAF
+*Single client/server.* The topology is a single client↔server dumbbell of `N`
+parallel paths, not a multi-hop mesh. Both backends now vary the *active* path
+count within a run via churn (§5.3.1, §3.9), and the scoring Transport agent
+(§7.3.1) consumes that variable set; two residual gaps remain between the
+backends' dynamics — they draw from independent RNG streams (behaviorally
+equivalent, not frame-identical), and correlated-failure group indices `≥` the
+topology's path count are dropped. (v) *Quality model:* the default VMAF
 is a documented log-anchor stand-in, not measured per-content quality; the
 optional `--learned-vmaf` surrogate (§6.3) is grounded in real WebRTC VMAF
 measurements but is still a fixed, content-agnostic grid (bitrate axis saturating
@@ -1037,8 +1085,8 @@ mobility per episode for domain randomization.
 | batch / buffer / start_steps / update_after | 256 / 200k / 1000 / 1000 | `SACConfig` |
 | cwnd / buffer obs normalizers | 200 000 B | `realtime_env.py` |
 | `transport_arch` | `flat` (default) / `scoring` | `configs/*.yaml` `run:` |
-| `dynamics` (churn/regime/burst/corr) | off by default; on in `configs/dynamic.yaml` | `DynamicsConfig`, `dataplane.py` |
-| paths (rate/delay/cross), NS-3 | 3/3/2.5/2 Mbps · 10/15/40/20 ms · 0.40/0.45/0.30/0.55 | `ScenarioConfig`, `configs/four_path.yaml` |
+| `dynamics` (churn/regime/burst/corr) | off by default (both backends); on in `configs/dynamic.yaml` | `DynamicsConfig`, `dataplane.py`, `realtime_mpquic.cc` |
+| paths (rate/delay/cross), NS-3 | built-in default 3/3/2.5/2 Mbps · 10/15/40/20 ms · 0.40/0.45/0.30/0.55; overridable via forwarded `topology:` | `ScenarioConfig`, `configs/*.yaml` |
 | `cap_mbps` (throughput normalizer) | 12 (4-path) / 10 (legacy 3-path) | `configs/*.yaml` |
 | paths (rate/delay/cross), legacy mock | 8/4/2 Mbps · 10/17/30 ms · 0.45/0.65/0.35 | `configs/default.yaml` |
 | kMaxPaths | 8 | `realtime_mpquic.h` |
@@ -1048,7 +1096,7 @@ mobility per episode for domain randomization.
 | Path | Role |
 |---|---|
 | `ns3/realtime_mpquic.h` | `EnvStruct`/`ActStruct` wire contract |
-| `ns3/realtime_mpquic.cc` | NS-3 scenario: topology, subflows, frame generation, striping, completion tracking, decision loop |
+| `ns3/realtime_mpquic.cc` | NS-3 scenario: topology, subflows, frame generation, striping, completion tracking, decision loop, non-stationary dynamics (§3.9) |
 | `ns3/realtime_mpquic_py.cc` | pybind11 binding of the structs + interface |
 | `ns3/CMakeLists.txt`, `scripts/install_ns3_example.sh` | build + install into ns-3-dev |
 | `src/ns3env/dataplane.py` | `DataPlane` ABC, `MockRealtimeDataPlane`, `Ns3DataPlane`, `FrameObs`/`FrameResult` |

@@ -50,6 +50,11 @@ struct EnvStruct
     double pathThroughputMbps[kMaxPaths]; // EWMA delivered goodput per path
     double pathLoss[kMaxPaths];           // network loss estimate per path [0,1]
 
+    // Per-path liveness mask: 1 = live, 0 = churned out (its bytes are lost).
+    // With dynamics disabled every slot < numPaths is 1. Mirrors
+    // FrameObs.path_active in src/ns3env/dataplane.py.
+    uint8_t pathActive[kMaxPaths];
+
     // --- Realized result of the most-recently-completed frame ------------- //
     // lastBytes == 0 before the first frame completes.
     double lastLatencyMs; // generation -> last-byte-received latency
