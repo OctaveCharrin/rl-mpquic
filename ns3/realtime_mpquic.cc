@@ -344,6 +344,7 @@ class RealtimeController
         m_devs.resize(n);
         m_baseRate.resize(n);
         m_baseRttMs.assign(n, 0.0);
+        m_maxBufferBytes.assign(n, 0.0);
 
         Ipv4AddressHelper addr;
         for (uint32_t i = 0; i < n; ++i)
@@ -357,6 +358,12 @@ class RealtimeController
             // Base RTT ~ 2 x one-way propagation delay (ms); a neutral sRTT
             // placeholder reported for churned-out paths (mirrors the mock).
             m_baseRttMs[i] = 2.0 * Time(m_cfg.paths[i].delay).GetSeconds() * 1000.0;
+            // WebRTC-style backlog bound: at most one deadline's worth of bytes at
+            // this path's nominal rate. A stalled/reconnecting/throttled path (e.g.
+            // mid-churn) drops fresh shares instead of accumulating unbounded stale
+            // backlog that bursts out and desyncs delivery once it recovers.
+            m_maxBufferBytes[i] =
+                (m_cfg.deadlineMs / 1000.0) * m_baseRate[i].GetBitRate() / 8.0;
 
             // Per-path AQM so loss + queueing delay emerge under load.
             TrafficControlHelper tch;
@@ -651,6 +658,12 @@ class RealtimeController
         {
             if (env.done)
             {
+                std::cerr << "[selftest ep end] completed=" << m_dbgCompleted
+                          << " expired=" << m_dbgExpired
+                          << " firstLatMs=" << m_dbgFirstCompletedLatMs
+                          << " meanLatMs=" << (m_dbgCompleted > 0 ? m_dbgSumLatMs / m_dbgCompleted : 0.0)
+                          << " lossRate=" << (double)m_dbgExpired / (m_dbgCompleted + m_dbgExpired)
+                          << "\n";
                 Simulator::Stop();
                 return;
             }
@@ -758,6 +771,16 @@ class RealtimeController
                 m_pathLossCache[i] = 1.0;
                 continue;
             }
+            if (m_sources[i]->GetBufferOcc() > m_maxBufferBytes[i])
+            {
+                // Path already has more than one deadline's worth of unsent app
+                // backlog (e.g. mid-churn/regime stall or still reconnecting after
+                // an episode reset): drop this frame's share instead of piling on
+                // more stale bytes that would only arrive late anyway.
+                droppedBytes += shares[i];
+                m_pathLossCache[i] = 1.0;
+                continue;
+            }
             ++activeShares;
             m_pathEnq[i] += shares[i];
             m_shareQ[i].push_back(ShareEntry{m_pathEnq[i], fId, shares[i]});
@@ -772,6 +795,15 @@ class RealtimeController
 
         m_frames[fId] = FrameRec{activeShares, now, now, frameBytes, droppedBytes};
         m_pendingFrames.push_back(fId);
+        if (m_selftest && fId < 30)
+        {
+            std::ostringstream ss;
+            for (uint32_t i = 0; i < n; ++i)
+                ss << (PathLive(i) ? "L" : "D") << shares[i] << " ";
+            std::cerr << "[gen] fid=" << fId << " t=" << now
+                      << " bytes=" << frameBytes << " active=" << activeShares
+                      << " paths:[" << ss.str() << "]\n";
+        }
     }
 
     // Sink reports cumulative delivered bytes on path `pathIdx`; resolve any
@@ -835,6 +867,15 @@ class RealtimeController
         m_lastLoss = frameLoss;
         m_lastBytes = static_cast<uint32_t>(delivered);
 
+        if (m_selftest)
+        {
+            ++m_dbgCompleted;
+            m_dbgSumLatMs += latencyMs;
+            if (m_dbgFirstCompletedLatMs < 0.0) m_dbgFirstCompletedLatMs = latencyMs;
+            if (m_dbgCompleted + m_dbgExpired <= 30)
+                std::cerr << "[frame] COMPLETE fid=" << fr.genTimeS
+                          << " latMs=" << latencyMs << " loss=" << frameLoss << "\n";
+        }
         m_frames.erase(it);
     }
 
@@ -864,6 +905,13 @@ class RealtimeController
             m_lastJitterMs = 0.0;
             m_lastLoss = 1.0;
             m_lastBytes = 0;
+            if (m_selftest) {
+                ++m_dbgExpired;
+                if (m_dbgCompleted + m_dbgExpired <= 30)
+                    std::cerr << "[frame] EXPIRE fid=" << it->second.genTimeS
+                              << " elapsedMs=" << elapsedMs
+                              << " sharesLeft=" << it->second.sharesRemaining << "\n";
+            }
             m_frames.erase(it);
         }
     }
@@ -958,6 +1006,11 @@ class RealtimeController
     {
         // Keep the network (and cumulative byte counters / share queues) warm so
         // congestion evolves across episodes; only reset episode-scoped state.
+        // The per-path app backlog (RealtimeSource::m_pending) is bounded
+        // continuously by GenerateFrame's deadline-based cap (see
+        // m_maxBufferBytes), so it can no longer grow into the multi-MB
+        // cross-episode backlog that used to stall delivery for an entire
+        // episode — no explicit flush/socket-reset needed here.
         m_frames.clear();
         m_pendingFrames.clear();
         m_frameInEpisode = 0;
@@ -991,6 +1044,7 @@ class RealtimeController
     std::vector<NetDeviceContainer> m_devs;
     std::vector<DataRate> m_baseRate;
     std::vector<double> m_baseRttMs;
+    std::vector<double> m_maxBufferBytes; // per-path app backlog cap (bytes)
 
     // Non-stationary dynamics state (mirrors MockRealtimeDataPlane).
     std::vector<uint8_t> m_active;             // per-path liveness (churn)
@@ -1023,6 +1077,12 @@ class RealtimeController
     uint64_t m_frameTotal = 0;     // monotonic frame id (process lifetime)
     uint32_t m_frameInEpisode = 0; // resets each episode
     double m_episodeStartS = 0.0;
+
+    // Diagnostic counters (selftest only).
+    uint32_t m_dbgCompleted = 0;
+    uint32_t m_dbgExpired = 0;
+    double m_dbgFirstCompletedLatMs = -1.0;
+    double m_dbgSumLatMs = 0.0;
 
     FlowMonitorHelper m_fmh;
     Ptr<FlowMonitor> m_monitor;
