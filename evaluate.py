@@ -32,6 +32,13 @@ def main() -> None:
     p.add_argument("--app", default=None, help="App agent checkpoint (app.pth)")
     p.add_argument("--transport", default=None, help="Transport agent checkpoint (transport.pth)")
     p.add_argument("--out", default=None, help="output run dir (default runs/eval-<ts>)")
+    p.add_argument(
+        "--ns3-transport",
+        choices=["tcp", "udp"],
+        default=None,
+        help="ns3 backend per-path transport protocol (overrides the config's "
+        "run.transport; ignored by --backend mock, which is already UDP-like)",
+    )
     p.add_argument("--figures", action="store_true", help="render figures after evaluating")
     p.add_argument("--show-output", action="store_true", help="stream NS-3 stdout/stderr")
     p.add_argument(
@@ -51,6 +58,8 @@ def main() -> None:
         p.error("--ablation requires both --app and --transport checkpoints")
 
     cfg = load_config(args.config)
+    if args.ns3_transport:
+        cfg.transport = args.ns3_transport
     out_dir = args.out or os.path.join(cfg.out_dir, "eval-" + time.strftime("%Y%m%d-%H%M%S"))
     run_evaluation(
         cfg,

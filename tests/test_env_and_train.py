@@ -4,7 +4,7 @@ import numpy as np
 
 from src.ns3env.dataplane import MockRealtimeConfig, MockRealtimeDataPlane
 from src.ns3env.realtime_env import HierarchicalRealtimeEnv
-from src.train.config import load_config, parse_delay_ms, parse_rate_mbps
+from src.train.config import ExperimentConfig, load_config, parse_delay_ms, parse_rate_mbps
 from src.train.hierarchical_train import run_training
 
 
@@ -51,6 +51,23 @@ def test_rate_delay_parsers():
     assert abs(parse_rate_mbps("500kbps") - 0.5) < 1e-9
     assert parse_delay_ms("10ms") == 10.0
     assert parse_delay_ms("0.5s") == 500.0
+
+
+def test_transport_defaults_to_tcp_and_round_trips():
+    cfg = ExperimentConfig()
+    assert cfg.transport == "tcp"
+    assert cfg.ns3_dataplane().config.transport == "tcp"
+
+    cfg.transport = "udp"
+    assert cfg.ns3_dataplane().config.transport == "udp"
+
+
+def test_load_config_parses_run_transport(tmp_path):
+    path = tmp_path / "udp.yaml"
+    path.write_text("run:\n  transport: udp\n")
+    cfg = load_config(str(path))
+    assert cfg.transport == "udp"
+    assert load_config(None).transport == "tcp"
 
 
 def test_training_smoke_mock(tmp_path):

@@ -70,6 +70,10 @@ class ExperimentConfig:
     # "scoring" (permutation-equivariant, variable-path-count SAC). "flat" is the
     # default so existing configs/checkpoints are unaffected.
     transport_arch: str = "flat"
+    # Per-path transport backend for the NS-3 scenario: "tcp" (default) or "udp"
+    # (explicit app-layer deadline-drop instead of TCP retransmission). Ignored
+    # by the mock backend, which is already UDP-like.
+    transport: str = "tcp"
     # Optional non-stationary mock dynamics (None => fully static mock network).
     # Ignored by the NS-3 backend.
     dynamics: Optional[DynamicsConfig] = None
@@ -128,6 +132,7 @@ class ExperimentConfig:
             seed=seed if seed is not None else self.seed,
             dynamics=self.dynamics,
             topology=self.paths,
+            transport=self.transport,
         )
         # Aggregate capacity cap ~ sum of nominal link rates (Mbps).
         cap = sum(parse_rate_mbps(p["rate"]) for p in self.paths) or self.cap_mbps
@@ -198,6 +203,7 @@ def load_config(path: Optional[str] = None) -> ExperimentConfig:
     cfg.cap_mbps = float(run.get("cap_mbps", 10.0))
     cfg.out_dir = str(run.get("out_dir", "runs"))
     cfg.transport_arch = str(run.get("transport_arch", sac.get("transport_arch", "flat")))
+    cfg.transport = str(run.get("transport", "tcp"))
 
     cfg.dynamics = _parse_dynamics(data.get("dynamics"))
     return cfg

@@ -52,6 +52,32 @@ using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("RealtimeMpquic");
 
+// Per-path transport backend. TCP is the original stock-TCP-subflow model;
+// UDP is unreliable/unordered with explicit app-layer deadline-based
+// dropping instead of TCP's reliable in-order retransmission (see
+// RealtimeSource::DrainUdp). Default is Tcp so the scenario is byte-identical
+// unless --transport udp is explicitly requested.
+enum class Transport
+{
+    Tcp,
+    Udp,
+};
+
+// Fixed 24-byte POD header prepended to every UDP data fragment. Raw
+// memcpy'd (not an ns3::Header subclass) since sender and receiver are both
+// simulated in this one process — there is no real wire-interop need for
+// pcap-introspectable framing here.
+struct UdpFrameHeader
+{
+    uint64_t frameId;     // which video frame this fragment belongs to
+    double departTimeS;   // Simulator::Now() at send time (RTT-fallback input)
+    uint32_t shareBytes;  // total size of this path's share (same on every fragment,
+                          // so completion can be detected even if other fragments are lost)
+    uint32_t fragOffset;  // byte offset of this fragment within the share (diagnostic)
+};
+// + 24B header + 28B IPv4/UDP overhead stays comfortably under a 1500B MTU.
+static constexpr uint32_t kUdpPayloadCap = 1400;
+
 // --------------------------------------------------------------------------- //
 // RealtimeSource — server-side persistent bulk sender over one TCP subflow.
 // Enqueue(bytes) appends to an application send backlog that is drained into the
@@ -71,13 +97,15 @@ class RealtimeSource : public Application
         return tid;
     }
 
-    void Configure(Address peer, uint32_t pathIdx)
+    void Configure(Address peer, uint32_t pathIdx, Transport transport, double deadlineS)
     {
         m_peer = peer;
         m_pathIdx = pathIdx;
+        m_transport = transport;
+        m_deadlineS = deadlineS;
     }
 
-    // Append `bytes` to the send backlog; push immediately if connected.
+    // Append `bytes` to the send backlog; push immediately if connected. TCP mode only.
     void Enqueue(uint32_t bytes)
     {
         m_pending += bytes;
@@ -87,23 +115,63 @@ class RealtimeSource : public Application
         }
     }
 
+    // UDP mode: enqueue one frame's share, tagged with its generation time so
+    // DrainUdp can write off the remainder if it goes stale before it's sent.
+    void EnqueueShare(uint64_t frameId, double genTimeS, uint32_t bytes)
+    {
+        m_pendingShares.push_back(PendingShare{frameId, genTimeS, bytes, 0});
+        m_pendingUdpBytes += bytes;
+        if (m_connected)
+        {
+            DrainUdp();
+        }
+    }
+
     double GetSrttMs() const { return m_srttMs; }
     double GetCwnd() const { return m_cwnd; }
-    double GetBufferOcc() const { return static_cast<double>(m_pending); }
+    double GetBufferOcc() const
+    {
+        return m_transport == Transport::Udp ? static_cast<double>(m_pendingUdpBytes)
+                                              : static_cast<double>(m_pending);
+    }
 
   private:
+    struct PendingShare
+    {
+        uint64_t frameId;
+        double genTimeS;
+        uint32_t bytesRemaining;
+        uint32_t offset;
+    };
+
     void StartApplication() override
     {
-        m_socket = Socket::CreateSocket(GetNode(), TcpSocketFactory::GetTypeId());
+        TypeId tid = (m_transport == Transport::Udp) ? UdpSocketFactory::GetTypeId()
+                                                       : TcpSocketFactory::GetTypeId();
+        m_socket = Socket::CreateSocket(GetNode(), tid);
         m_socket->Bind();
         m_socket->Connect(m_peer);
-        m_socket->SetConnectCallback(MakeCallback(&RealtimeSource::ConnectSucceeded, this),
-                                     MakeCallback(&RealtimeSource::ConnectFailed, this));
-        m_socket->SetSendCallback(MakeCallback(&RealtimeSource::OnSendPossible, this));
-        // TcpSocketBase trace sources; connect once the object exists.
-        m_socket->TraceConnectWithoutContext("RTT", MakeCallback(&RealtimeSource::RttTrace, this));
-        m_socket->TraceConnectWithoutContext("CongestionWindow",
-                                             MakeCallback(&RealtimeSource::CwndTrace, this));
+        if (m_transport == Transport::Udp)
+        {
+            // UdpSocketImpl::Connect() is synchronous (sets the default peer and
+            // returns immediately) and has no "RTT"/"CongestionWindow" trace
+            // sources (TCP-only), so skip the TCP-only hookups entirely.
+            m_connected = true;
+            if (!m_pendingShares.empty())
+            {
+                DrainUdp();
+            }
+        }
+        else
+        {
+            m_socket->SetConnectCallback(MakeCallback(&RealtimeSource::ConnectSucceeded, this),
+                                         MakeCallback(&RealtimeSource::ConnectFailed, this));
+            m_socket->SetSendCallback(MakeCallback(&RealtimeSource::OnSendPossible, this));
+            // TcpSocketBase trace sources; connect once the object exists.
+            m_socket->TraceConnectWithoutContext("RTT", MakeCallback(&RealtimeSource::RttTrace, this));
+            m_socket->TraceConnectWithoutContext("CongestionWindow",
+                                                 MakeCallback(&RealtimeSource::CwndTrace, this));
+        }
     }
 
     void StopApplication() override
@@ -157,6 +225,50 @@ class RealtimeSource : public Application
         }
     }
 
+    // Push the UDP backlog out as fixed-size datagrams. Before sending each
+    // fragment, check whether its share has already gone stale (past the
+    // frame deadline); if so, write off the remaining bytes without ever
+    // calling Socket::Send() — this is the explicit app-layer deadline-drop
+    // that replaces TCP's reliable in-order retransmission (mirrors
+    // MockRealtimeDataPlane.step_frame's "no retransmission, write off stale
+    // data" behavior).
+    void DrainUdp()
+    {
+        const double now = Simulator::Now().GetSeconds();
+        while (!m_pendingShares.empty())
+        {
+            PendingShare& s = m_pendingShares.front();
+            if (now > s.genTimeS + m_deadlineS)
+            {
+                m_pendingUdpBytes -= s.bytesRemaining;
+                m_pendingShares.pop_front();
+                continue;
+            }
+            uint32_t chunk = std::min(s.bytesRemaining, kUdpPayloadCap);
+            UdpFrameHeader hdr{s.frameId, now, s.offset + s.bytesRemaining, s.offset};
+            Ptr<Packet> hdrPkt =
+                Create<Packet>(reinterpret_cast<const uint8_t*>(&hdr), sizeof(hdr));
+            hdrPkt->AddAtEnd(Create<Packet>(chunk));
+            int sent = m_socket->Send(hdrPkt);
+            if (sent <= 0)
+            {
+                // Rare (e.g. transient MSGSIZE/ARP-not-resolved): write off the
+                // rest of the share rather than retry-scheduling, consistent
+                // with "no retransmission" end-to-end.
+                m_pendingUdpBytes -= s.bytesRemaining;
+                m_pendingShares.pop_front();
+                break;
+            }
+            s.bytesRemaining -= chunk;
+            s.offset += chunk;
+            m_pendingUdpBytes -= chunk;
+            if (s.bytesRemaining == 0)
+            {
+                m_pendingShares.pop_front();
+            }
+        }
+    }
+
     void RttTrace(Time, Time newRtt)
     {
         double sample = newRtt.GetSeconds() * 1000.0;
@@ -172,6 +284,11 @@ class RealtimeSource : public Application
     bool m_connected = false;
     double m_srttMs = 0.0;
     double m_cwnd = 0.0;
+
+    Transport m_transport = Transport::Tcp;
+    double m_deadlineS = 0.0;
+    std::deque<PendingShare> m_pendingShares; // UDP-mode backlog only
+    uint64_t m_pendingUdpBytes = 0;
 };
 
 // --------------------------------------------------------------------------- //
@@ -194,22 +311,35 @@ class RealtimeSink : public Application
 
     void Configure(Address bindAddr,
                    uint32_t pathIdx,
-                   Callback<void, uint32_t, uint64_t, Time> onBytes)
+                   Transport transport,
+                   Callback<void, uint32_t, uint64_t, Time> onBytes,
+                   Callback<void, uint32_t, uint64_t, uint32_t, uint32_t, double, Time> onDatagram)
     {
         m_bind = bindAddr;
         m_pathIdx = pathIdx;
+        m_transport = transport;
         m_onBytes = onBytes;
+        m_onDatagram = onDatagram;
     }
 
   private:
     void StartApplication() override
     {
-        m_listen = Socket::CreateSocket(GetNode(), TcpSocketFactory::GetTypeId());
-        m_listen->Bind(m_bind);
-        m_listen->Listen();
-        m_listen->SetAcceptCallback(
-            MakeNullCallback<bool, Ptr<Socket>, const Address&>(),
-            MakeCallback(&RealtimeSink::HandleAccept, this));
+        if (m_transport == Transport::Udp)
+        {
+            m_listen = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+            m_listen->Bind(m_bind);
+            m_listen->SetRecvCallback(MakeCallback(&RealtimeSink::HandleReadUdp, this));
+        }
+        else
+        {
+            m_listen = Socket::CreateSocket(GetNode(), TcpSocketFactory::GetTypeId());
+            m_listen->Bind(m_bind);
+            m_listen->Listen();
+            m_listen->SetAcceptCallback(
+                MakeNullCallback<bool, Ptr<Socket>, const Address&>(),
+                MakeCallback(&RealtimeSink::HandleAccept, this));
+        }
     }
 
     void StopApplication() override
@@ -242,11 +372,32 @@ class RealtimeSink : public Application
         }
     }
 
+    void HandleReadUdp(Ptr<Socket> s)
+    {
+        Ptr<Packet> pkt;
+        Address from;
+        while ((pkt = s->RecvFrom(from)))
+        {
+            if (pkt->GetSize() == 0)
+            {
+                break;
+            }
+            UdpFrameHeader hdr{};
+            pkt->CopyData(reinterpret_cast<uint8_t*>(&hdr), sizeof(hdr));
+            pkt->RemoveAtStart(sizeof(hdr));
+            uint32_t fragBytes = pkt->GetSize();
+            m_onDatagram(m_pathIdx, hdr.frameId, hdr.shareBytes, fragBytes, hdr.departTimeS,
+                        Simulator::Now());
+        }
+    }
+
     Ptr<Socket> m_listen;
     Address m_bind;
     uint32_t m_pathIdx = 0;
-    uint64_t m_cumBytes = 0; // cumulative bytes delivered since connection
+    uint64_t m_cumBytes = 0; // cumulative bytes delivered since connection (TCP mode)
+    Transport m_transport = Transport::Tcp;
     Callback<void, uint32_t, uint64_t, Time> m_onBytes;
+    Callback<void, uint32_t, uint64_t, uint32_t, uint32_t, double, Time> m_onDatagram;
 };
 
 // --------------------------------------------------------------------------- //
@@ -283,6 +434,7 @@ struct ScenarioConfig
     uint32_t keyframeInterval = 30;
     uint32_t seed = 1;
     uint16_t basePort = 5000;
+    Transport transport = Transport::Tcp; // default: byte-identical to pre-UDP behavior
 
     // --- Optional non-stationary dynamics (mirrors DynamicsConfig in Python) --//
     // All OFF by default so the static scenario reproduces byte-for-byte: when
@@ -339,6 +491,7 @@ class RealtimeController
         m_shareQ.resize(n);
         m_pathThrEwma.assign(n, 0.0);
         m_pathLossCache.assign(n, 0.0);
+        m_udpSrttEwmaMs.assign(n, 0.0);
         m_curSplit.assign(n, 1.0 / n);
         m_curBitrateKbps = m_cfg.initBitrateKbps;
         m_devs.resize(n);
@@ -440,13 +593,16 @@ class RealtimeController
         Ptr<RealtimeSink> sink = CreateObject<RealtimeSink>();
         sink->Configure(InetSocketAddress(Ipv4Address::GetAny(), port),
                         i,
-                        MakeCallback(&RealtimeController::OnPathBytes, this));
+                        m_cfg.transport,
+                        MakeCallback(&RealtimeController::OnPathBytes, this),
+                        MakeCallback(&RealtimeController::OnPathDatagram, this));
         m_client.Get(0)->AddApplication(sink);
         sink->SetStartTime(Seconds(0.0));
         m_sinks[i] = sink;
 
         Ptr<RealtimeSource> src = CreateObject<RealtimeSource>();
-        src->Configure(InetSocketAddress(clientIp, port), i);
+        src->Configure(InetSocketAddress(clientIp, port), i, m_cfg.transport,
+                       m_cfg.deadlineMs / 1000.0);
         m_server.Get(0)->AddApplication(src);
         src->SetStartTime(Seconds(0.1)); // after the sink is listening
         m_sources[i] = src;
@@ -782,9 +938,16 @@ class RealtimeController
                 continue;
             }
             ++activeShares;
-            m_pathEnq[i] += shares[i];
-            m_shareQ[i].push_back(ShareEntry{m_pathEnq[i], fId, shares[i]});
-            m_sources[i]->Enqueue(shares[i]);
+            if (m_cfg.transport == Transport::Udp)
+            {
+                m_sources[i]->EnqueueShare(fId, now, shares[i]);
+            }
+            else
+            {
+                m_pathEnq[i] += shares[i];
+                m_shareQ[i].push_back(ShareEntry{m_pathEnq[i], fId, shares[i]});
+                m_sources[i]->Enqueue(shares[i]);
+            }
         }
         if (activeShares == 0)
         {
@@ -806,8 +969,32 @@ class RealtimeController
         }
     }
 
+    // Shared downstream sink for both transports: a path's share of `frameId`
+    // has just fully arrived. Updates the per-path goodput EWMA and completes
+    // the frame once every share has arrived.
+    void OnShareDelivered(uint32_t pathIdx, uint64_t frameId, uint32_t shareBytes, double t)
+    {
+        auto it = m_frames.find(frameId);
+        if (it == m_frames.end())
+        {
+            return; // frame already completed or expired
+        }
+        FrameRec& fr = it->second;
+        fr.completeTimeS = std::max(fr.completeTimeS, t);
+
+        // Per-path realized goodput for this share.
+        double shareDur = std::max(t - fr.genTimeS, 1e-6);
+        double gp = (shareBytes * 8.0) / (shareDur * 1e6);
+        m_pathThrEwma[pathIdx] = 0.6 * m_pathThrEwma[pathIdx] + 0.4 * gp;
+
+        if (--fr.sharesRemaining == 0)
+        {
+            CompleteFrame(it);
+        }
+    }
+
     // Sink reports cumulative delivered bytes on path `pathIdx`; resolve any
-    // frame shares whose watermark is now reached.
+    // frame shares whose watermark is now reached. TCP mode only.
     void OnPathBytes(uint32_t pathIdx, uint64_t cumDelivered, Time when)
     {
         auto& q = m_shareQ[pathIdx];
@@ -816,23 +1003,35 @@ class RealtimeController
         {
             ShareEntry e = q.front();
             q.pop_front();
-            auto it = m_frames.find(e.frameId);
-            if (it == m_frames.end())
-            {
-                continue; // frame already completed or expired
-            }
-            FrameRec& fr = it->second;
-            fr.completeTimeS = std::max(fr.completeTimeS, t);
+            OnShareDelivered(pathIdx, e.frameId, e.bytes, t);
+        }
+    }
 
-            // Per-path realized goodput for this share.
-            double shareDur = std::max(t - fr.genTimeS, 1e-6);
-            double gp = (e.bytes * 8.0) / (shareDur * 1e6);
-            m_pathThrEwma[pathIdx] = 0.6 * m_pathThrEwma[pathIdx] + 0.4 * gp;
+    // Sink reports one UDP fragment. Accumulates per-(frameId,pathIdx) bytes
+    // received; once the whole share has arrived, resolves it the same way
+    // TCP's watermark match does. Also feeds the app-level RTT-fallback EWMA
+    // from the fragment's departure->arrival transit time (both ends live in
+    // this one process, so no wire echo/ACK protocol is needed to sample it).
+    void OnPathDatagram(uint32_t pathIdx, uint64_t frameId, uint32_t shareBytes,
+                        uint32_t fragBytes, double departTimeS, Time when)
+    {
+        const double t = when.GetSeconds();
+        double oneWayMs = std::max(0.0, (t - departTimeS) * 1000.0);
+        double sample = 2.0 * oneWayMs; // RTT-doubling convention (comparable to TCP's srttMs)
+        m_udpSrttEwmaMs[pathIdx] = (m_udpSrttEwmaMs[pathIdx] <= 0.0)
+                                       ? sample
+                                       : 0.85 * m_udpSrttEwmaMs[pathIdx] + 0.15 * sample;
 
-            if (--fr.sharesRemaining == 0)
+        uint64_t& recv = m_udpRecvBytes[frameId][pathIdx];
+        recv += fragBytes;
+        if (recv >= shareBytes)
+        {
+            m_udpRecvBytes[frameId].erase(pathIdx);
+            if (m_udpRecvBytes[frameId].empty())
             {
-                CompleteFrame(it);
+                m_udpRecvBytes.erase(frameId);
             }
+            OnShareDelivered(pathIdx, frameId, shareBytes, t);
         }
     }
 
@@ -876,6 +1075,7 @@ class RealtimeController
                 std::cerr << "[frame] COMPLETE fid=" << fr.genTimeS
                           << " latMs=" << latencyMs << " loss=" << frameLoss << "\n";
         }
+        m_udpRecvBytes.erase(it->first); // no-op unless UDP mode left a partial entry
         m_frames.erase(it);
     }
 
@@ -912,6 +1112,7 @@ class RealtimeController
                               << " elapsedMs=" << elapsedMs
                               << " sharesLeft=" << it->second.sharesRemaining << "\n";
             }
+            m_udpRecvBytes.erase(fId); // bound memory: straggler UDP fragments never resolve
             m_frames.erase(it);
         }
     }
@@ -938,10 +1139,25 @@ class RealtimeController
             double s;
             if (live)
             {
-                s = m_sources[i]->GetSrttMs();
-                env.cwnd[i] = m_sources[i]->GetCwnd();
-                env.bufferOcc[i] = m_sources[i]->GetBufferOcc();
-                env.pathThroughputMbps[i] = m_pathThrEwma[i];
+                if (m_cfg.transport == Transport::Udp)
+                {
+                    // No TCP congestion window/RTT trace sources under UDP.
+                    // srttMs: measured (2x one-way transit) EWMA, falling back to
+                    // the static base RTT before the first sample arrives.
+                    // cwnd: BDP-style proxy (measured throughput x measured RTT),
+                    // mirroring MockRealtimeDataPlane's analytical cwnd formula.
+                    s = (m_udpSrttEwmaMs[i] > 0.0) ? m_udpSrttEwmaMs[i] : m_baseRttMs[i];
+                    env.pathThroughputMbps[i] = m_pathThrEwma[i];
+                    env.cwnd[i] = env.pathThroughputMbps[i] * 1e6 / 8.0 * s / 1000.0;
+                    env.bufferOcc[i] = m_sources[i]->GetBufferOcc();
+                }
+                else
+                {
+                    s = m_sources[i]->GetSrttMs();
+                    env.cwnd[i] = m_sources[i]->GetCwnd();
+                    env.bufferOcc[i] = m_sources[i]->GetBufferOcc();
+                    env.pathThroughputMbps[i] = m_pathThrEwma[i];
+                }
                 env.pathLoss[i] = m_pathLossCache[i];
             }
             else
@@ -983,9 +1199,15 @@ class RealtimeController
         for (const auto& kv : stats)
         {
             Ipv4FlowClassifier::FiveTuple ft = m_classifier->FindFlow(kv.first);
-            if (ft.protocol != 6)
+            // Video flows use ports [basePort, basePort+numPaths); cross-traffic
+            // uses [basePort+100, basePort+100+numPaths) — a port-range filter
+            // isolates the video flow regardless of transport (TCP or UDP),
+            // unlike a protocol==6 check which would exclude UDP-mode video
+            // traffic entirely (it's protocol 17, same as the cross-traffic).
+            if (ft.destinationPort < m_cfg.basePort ||
+                ft.destinationPort >= m_cfg.basePort + NumPaths())
             {
-                continue; // TCP video flow only
+                continue;
             }
             for (uint32_t i = 0; i < NumPaths(); ++i)
             {
@@ -1013,6 +1235,7 @@ class RealtimeController
         // episode — no explicit flush/socket-reset needed here.
         m_frames.clear();
         m_pendingFrames.clear();
+        m_udpRecvBytes.clear();
         m_frameInEpisode = 0;
         m_episodeStartS = now;
         m_prevLatencyMs = -1.0;
@@ -1058,10 +1281,15 @@ class RealtimeController
     std::vector<std::deque<ShareEntry>> m_shareQ; // pending shares per path (FIFO)
     std::unordered_map<uint64_t, FrameRec> m_frames;
     std::deque<uint64_t> m_pendingFrames;        // frame ids in generation order
+    // UDP mode only: frameId -> pathIdx -> bytes received so far.
+    std::unordered_map<uint64_t, std::unordered_map<uint32_t, uint64_t>> m_udpRecvBytes;
 
     // Episode-scoped aggregates.
     std::vector<double> m_pathThrEwma;
     std::vector<double> m_pathLossCache;
+    // UDP mode only: per-path RTT-fallback EWMA (2x measured one-way transit
+    // delay). Persists warm across episodes, like m_pathThrEwma/m_pathLossCache.
+    std::vector<double> m_udpSrttEwmaMs;
     std::vector<double> m_curSplit;
     double m_curBitrateKbps = 0.0;
     double m_prevLatencyMs = -1.0;
@@ -1127,6 +1355,7 @@ main(int argc, char* argv[])
     ScenarioConfig cfg;
     bool selftest = false;
     std::string topology = ""; // empty => keep the hardcoded default path list
+    std::string transportStr = "tcp";
 
     CommandLine cmd;
     cmd.AddValue("fps", "Video frames per second", cfg.fps);
@@ -1140,6 +1369,7 @@ main(int argc, char* argv[])
     cmd.AddValue("selftest", "Run a self-contained even-split episode without the bridge",
                  selftest);
     cmd.AddValue("paths", "Topology: rate,delay,cross:... (empty => built-in default)", topology);
+    cmd.AddValue("transport", "Per-path transport backend: tcp|udp", transportStr);
     // Non-stationary dynamics (default OFF -> static scenario unchanged).
     cmd.AddValue("dynamicsEnabled", "Enable non-stationary path dynamics", cfg.dynamicsEnabled);
     cmd.AddValue("churn", "Enable path churn (appear/disappear)", cfg.churn);
@@ -1167,6 +1397,19 @@ main(int argc, char* argv[])
         {
             cfg.paths = parsed;
         }
+    }
+
+    if (transportStr == "tcp")
+    {
+        cfg.transport = Transport::Tcp;
+    }
+    else if (transportStr == "udp")
+    {
+        cfg.transport = Transport::Udp;
+    }
+    else
+    {
+        NS_ABORT_MSG("--transport must be 'tcp' or 'udp', got '" << transportStr << "'");
     }
 
     RngSeedManager::SetSeed(cfg.seed);

@@ -23,6 +23,13 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=None, help="override base seed")
     p.add_argument("--out-dir", default=None, help="run output directory")
     p.add_argument(
+        "--ns3-transport",
+        choices=["tcp", "udp"],
+        default=None,
+        help="ns3 backend per-path transport protocol (overrides the config's "
+        "run.transport; ignored by --backend mock, which is already UDP-like)",
+    )
+    p.add_argument(
         "--resume",
         action="store_true",
         help="reload latest checkpoints from --out-dir and continue training",
@@ -37,6 +44,8 @@ def main() -> None:
     args = p.parse_args()
 
     cfg = load_config(args.config)
+    if args.ns3_transport:
+        cfg.transport = args.ns3_transport
     run_training(
         cfg,
         backend=args.backend,

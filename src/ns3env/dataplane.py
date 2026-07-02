@@ -564,6 +564,11 @@ class Ns3Config:
     video: VideoSourceConfig = field(default_factory=VideoSourceConfig)
     seed: int = 1
 
+    # Per-path transport backend: "tcp" (default, byte-identical to before) or
+    # "udp" (explicit app-layer deadline-drop instead of TCP's reliable
+    # in-order retransmission -- see ns3/realtime_mpquic.cc's RealtimeSource).
+    transport: str = "tcp"
+
     # Optional non-stationary dynamics forwarded to the C++ body (None / disabled
     # => the static NS-3 scenario, byte-identical to before). The same
     # `DynamicsConfig` the mock consumes; the C++ mirrors churn/regime/burst and
@@ -689,6 +694,11 @@ class Ns3DataPlane(DataPlane):
 
         from ns3ai_utils import Experiment  # NS-3 env only
 
+        if self.config.transport not in ("tcp", "udp"):
+            raise ValueError(
+                f"Ns3Config.transport must be 'tcp' or 'udp', got {self.config.transport!r}"
+            )
+
         cwd = os.getcwd()
         try:
             self._exp = Experiment(_NS3_TARGET, self.ns3_dir, binding, handleFinish=True)
@@ -701,6 +711,7 @@ class Ns3DataPlane(DataPlane):
                 "minBitrateKbps": self.config.video.min_bitrate_kbps,
                 "maxBitrateKbps": self.config.video.max_bitrate_kbps,
                 "seed": max(1, int(self.config.seed)),  # NS-3 rejects seed 0
+                "transport": self.config.transport,
             }
             if self.config.topology:
                 setting["paths"] = _encode_topology(self.config.topology)
