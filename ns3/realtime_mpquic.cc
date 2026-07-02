@@ -927,6 +927,9 @@ class RealtimeController
         {
             return;
         }
+        // Envelope noise sigma matches MockRealtimeConfig.noise_std (0.05).
+        m_envNoise->SetAttribute("Mean", DoubleValue(0.0));
+        m_envNoise->SetAttribute("Variance", DoubleValue(0.05 * 0.05));
         std::stringstream gs(m_cfg.corrGroups);
         std::string grp;
         while (std::getline(gs, grp, ':'))
@@ -984,6 +987,26 @@ class RealtimeController
         return m;
     }
 
+    // Seasonal capacity envelope + per-frame noise (dynamics only), mirroring
+    // the mock's _PathTrace.capacity_mbps sinusoid so NS-3 per-path headroom
+    // dips like the mock's instead of sitting at the nominal DataRate. The
+    // amp/period/phase formulas must match ExperimentConfig.mock_dataplane
+    // (src/train/config.py). The mock's analytic cross-traffic sinusoid is NOT
+    // mirrored: the real CrossTrafficApp already provides that competition.
+    // Clocked from episode start like the mock's per-episode `t`.
+    double EnvelopeMult(uint32_t i)
+    {
+        if (!m_cfg.dynamicsEnabled) return 1.0;
+        static const double kPeriodsS[3] = {12.0, 7.0, 20.0};
+        const double amp = 0.45 + 0.1 * (i % 3);
+        const double period = kPeriodsS[i % 3];
+        const double phase = 2.0 * M_PI * i / std::max(1u, NumPaths());
+        const double t = Simulator::Now().GetSeconds() - m_episodeStartS;
+        const double season = 1.0 + amp * std::sin(2.0 * M_PI * t / period + phase);
+        const double noise = 1.0 + m_envNoise->GetValue();
+        return std::max(0.05, season * noise);
+    }
+
     // Push the current effective capacity onto the NS-3 bottleneck and scale the
     // cross-traffic source with it, so cross traffic stays a *fraction* of the
     // current capacity (multiplicative semantics, mirroring the mock's
@@ -993,7 +1016,7 @@ class RealtimeController
     void ApplyPathRate(uint32_t i)
     {
         if (!m_cfg.dynamicsEnabled) return;
-        double mult = CapMult(i);
+        double mult = CapMult(i) * EnvelopeMult(i);
         uint64_t bps =
             static_cast<uint64_t>(std::max(1e3, m_baseRate[i].GetBitRate() * mult));
         DataRateValue drv{DataRate(bps)};
@@ -1767,6 +1790,8 @@ class RealtimeController
     Ptr<UniformRandomVariable> m_uniform = CreateObject<UniformRandomVariable>();
     // Dedicated RNG stream for dynamics so frame-size jitter is unperturbed.
     Ptr<UniformRandomVariable> m_dynRng = CreateObject<UniformRandomVariable>();
+    // Capacity-envelope noise (dynamics only); variance set in InitDynamics.
+    Ptr<NormalRandomVariable> m_envNoise = CreateObject<NormalRandomVariable>();
     bool m_selftest = false;
 };
 

@@ -101,6 +101,8 @@ class ExperimentConfig:
         n = len(self.paths)
         # Per-path seasonality periods, cycled so any path count is covered
         # (truncating to [:n] under-fills when n exceeds the base list length).
+        # The amp/period formulas here are duplicated by EnvelopeMult in
+        # ns3/realtime_mpquic.cc (dynamics-only capacity envelope) — keep in sync.
         seasons = [12.0, 7.0, 20.0]
         cross_periods = [5.0, 3.0, 8.0]
         cfg = MockRealtimeConfig(

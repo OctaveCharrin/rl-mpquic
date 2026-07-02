@@ -73,7 +73,12 @@ by collapsing the link `DataRate`, which would strand a packet mid-serialization
 and zombify the path for ~10 s after revival; the TCP subflow is torn down on
 churn-out (queued shares written off as dropped) and reconnected on revival.
 Regime/burst/corr scale the per-path bottleneck `DataRate` **and the cross-traffic
-rate** proportionally (multiplicative semantics, like the mock). App bytes routed
+rate** proportionally (multiplicative semantics, like the mock). Under dynamics the
+C++ also mirrors the mock's *seasonal capacity envelope + noise* (`EnvelopeMult`,
+folded into `ApplyPathRate`; amp/period/phase formulas duplicated from
+`ExperimentConfig.mock_dataplane` in `src/train/config.py` — keep them in sync).
+Without it, NS-3 per-path headroom never dips near an even-split share and the
+app-only ablation trivially matches the full system. App bytes routed
 onto a dead path are dropped at generation (loss). Keep the mock and C++ in sync
 when either side changes; `uv run python scripts/parity_check.py` is the guard —
 it runs the same neutral even-split policy through both backends (mock in-process,
