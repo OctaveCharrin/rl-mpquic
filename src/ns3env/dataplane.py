@@ -75,9 +75,10 @@ class FrameObs:
     # 1.0. `num_paths` is the *candidate* count (the upper bound); the number of
     # active paths can vary per frame once churn is enabled.
     #
-    # CONTRACT: the NS-3 backend must report a matching `EnvStruct.pathActive[]`
-    # once C++-side churn lands (see ns3/realtime_mpquic.h, kMaxPaths). Until then
-    # Ns3DataPlane fills this with all-ones so the contract stays satisfiable.
+    # CONTRACT: both backends emit this mask — the mock from its churn machine,
+    # the NS-3 body from `EnvStruct.pathActive[]` (whose churn drops packets via
+    # drop-all error models, so a masked-live path is actually usable). Parity is
+    # guarded by scripts/parity_check.py.
     path_active: List[float] = field(default_factory=list)
 
     # Realized result of the most-recently-completed frame.
@@ -581,6 +582,10 @@ class Ns3Config:
     # its corr_groups indices become in-range). None => C++ default topology.
     topology: Optional[Sequence[dict]] = None
 
+    # Diagnostic: make the C++ body log per-path churn/connection state to
+    # stderr (pair with show_output=True). Off for normal runs.
+    churn_log: bool = False
+
 
 def _encode_topology(paths: Sequence[dict]) -> str:
     """Serialize the topology for the NS-3 CLI (shell-safe).
@@ -738,6 +743,8 @@ class Ns3DataPlane(DataPlane):
                     setting["corrGroups"] = corr
             else:
                 setting["dynamicsEnabled"] = 0
+            if self.config.churn_log:
+                setting["churnLog"] = 1
             self._msg = self._exp.run(setting=setting, show_output=self.show_output)
         finally:
             os.chdir(cwd)

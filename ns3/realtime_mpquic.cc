@@ -39,6 +39,7 @@
 #include "ns3/traffic-control-module.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <deque>
@@ -97,12 +98,20 @@ class RealtimeSource : public Application
         return tid;
     }
 
-    void Configure(Address peer, uint32_t pathIdx, Transport transport, double deadlineS)
+    void Configure(Address peer,
+                   uint32_t pathIdx,
+                   Transport transport,
+                   double deadlineS,
+                   uint32_t sndBufBytes = 0)
     {
         m_peer = peer;
         m_pathIdx = pathIdx;
         m_transport = transport;
         m_deadlineS = deadlineS;
+        // > 0 (dynamics only): cap the TCP send buffer so a stalled/churned
+        // path can hold at most ~one deadline's worth of in-flight bytes, and
+        // GetBufferOcc() can report socket occupancy as backpressure.
+        m_sndBufBytes = sndBufBytes;
     }
 
     // Append `bytes` to the send backlog; push immediately if connected. TCP mode only.
@@ -129,10 +138,64 @@ class RealtimeSource : public Application
 
     double GetSrttMs() const { return m_srttMs; }
     double GetCwnd() const { return m_cwnd; }
+    bool IsConnected() const { return m_connected; }
+    uint64_t GetPendingBytes() const { return m_pending; }
+
+    // Local (ephemeral) port of the current socket; 0 if none. Identifies the
+    // intended connection to the sink across churn reconnects.
+    uint16_t GetLocalPort() const
+    {
+        if (!m_socket)
+        {
+            return 0;
+        }
+        Address a;
+        if (m_socket->GetSockName(a) != 0 || !InetSocketAddress::IsMatchingType(a))
+        {
+            return 0;
+        }
+        return InetSocketAddress::ConvertFrom(a).GetPort();
+    }
     double GetBufferOcc() const
     {
-        return m_transport == Transport::Udp ? static_cast<double>(m_pendingUdpBytes)
-                                              : static_cast<double>(m_pending);
+        if (m_transport == Transport::Udp)
+        {
+            return static_cast<double>(m_pendingUdpBytes);
+        }
+        double occ = static_cast<double>(m_pending);
+        if (m_sndBufBytes > 0 && m_socket)
+        {
+            // Include the socket send-buffer fill so a stalling path shows
+            // backpressure well before the app-layer backlog cap trips.
+            occ += static_cast<double>(m_sndBufBytes) -
+                   static_cast<double>(m_socket->GetTxAvailable());
+        }
+        return occ;
+    }
+
+    // Tear down the TCP subflow (churn-down): detach callbacks, close the
+    // socket and write off the app backlog. Whatever was in flight dies with
+    // the outage; the peer-side sink ignores any stragglers.
+    void Teardown()
+    {
+        if (m_socket)
+        {
+            m_socket->SetConnectCallback(MakeNullCallback<void, Ptr<Socket>>(),
+                                         MakeNullCallback<void, Ptr<Socket>>());
+            m_socket->SetSendCallback(MakeNullCallback<void, Ptr<Socket>, uint32_t>());
+            m_socket->Close();
+            m_socket = nullptr;
+        }
+        m_connected = false;
+        m_pending = 0;
+    }
+
+    // Open a fresh TCP subflow after churn revival, so no stale send-buffer
+    // bytes or RTO backoff from the outage outlive it.
+    void Reconnect()
+    {
+        Teardown();
+        OpenTcpSocket();
     }
 
   private:
@@ -146,13 +209,11 @@ class RealtimeSource : public Application
 
     void StartApplication() override
     {
-        TypeId tid = (m_transport == Transport::Udp) ? UdpSocketFactory::GetTypeId()
-                                                       : TcpSocketFactory::GetTypeId();
-        m_socket = Socket::CreateSocket(GetNode(), tid);
-        m_socket->Bind();
-        m_socket->Connect(m_peer);
         if (m_transport == Transport::Udp)
         {
+            m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+            m_socket->Bind();
+            m_socket->Connect(m_peer);
             // UdpSocketImpl::Connect() is synchronous (sets the default peer and
             // returns immediately) and has no "RTT"/"CongestionWindow" trace
             // sources (TCP-only), so skip the TCP-only hookups entirely.
@@ -164,14 +225,27 @@ class RealtimeSource : public Application
         }
         else
         {
-            m_socket->SetConnectCallback(MakeCallback(&RealtimeSource::ConnectSucceeded, this),
-                                         MakeCallback(&RealtimeSource::ConnectFailed, this));
-            m_socket->SetSendCallback(MakeCallback(&RealtimeSource::OnSendPossible, this));
-            // TcpSocketBase trace sources; connect once the object exists.
-            m_socket->TraceConnectWithoutContext("RTT", MakeCallback(&RealtimeSource::RttTrace, this));
-            m_socket->TraceConnectWithoutContext("CongestionWindow",
-                                                 MakeCallback(&RealtimeSource::CwndTrace, this));
+            OpenTcpSocket();
         }
+    }
+
+    // Create + connect the TCP subflow socket (initial start and churn revival).
+    void OpenTcpSocket()
+    {
+        m_socket = Socket::CreateSocket(GetNode(), TcpSocketFactory::GetTypeId());
+        if (m_sndBufBytes > 0)
+        {
+            m_socket->SetAttribute("SndBufSize", UintegerValue(m_sndBufBytes));
+        }
+        m_socket->Bind();
+        m_socket->Connect(m_peer);
+        m_socket->SetConnectCallback(MakeCallback(&RealtimeSource::ConnectSucceeded, this),
+                                     MakeCallback(&RealtimeSource::ConnectFailed, this));
+        m_socket->SetSendCallback(MakeCallback(&RealtimeSource::OnSendPossible, this));
+        // TcpSocketBase trace sources; connect once the object exists.
+        m_socket->TraceConnectWithoutContext("RTT", MakeCallback(&RealtimeSource::RttTrace, this));
+        m_socket->TraceConnectWithoutContext("CongestionWindow",
+                                             MakeCallback(&RealtimeSource::CwndTrace, this));
     }
 
     void StopApplication() override
@@ -287,6 +361,7 @@ class RealtimeSource : public Application
 
     Transport m_transport = Transport::Tcp;
     double m_deadlineS = 0.0;
+    uint32_t m_sndBufBytes = 0; // > 0: TCP SndBufSize cap (dynamics only)
     std::deque<PendingShare> m_pendingShares; // UDP-mode backlog only
     uint64_t m_pendingUdpBytes = 0;
 };
@@ -322,6 +397,23 @@ class RealtimeSink : public Application
         m_onDatagram = onDatagram;
     }
 
+    // Churn-down: stop counting deliveries until the revival reconnect is
+    // accepted, so bytes from the dying subflow can't pollute the watermark
+    // space of shares enqueued after revival.
+    void Invalidate() { m_current = nullptr; }
+
+    // Churn revival: only the connection from this source port may become the
+    // current subflow. A rapid churn flap can leave a half-open child of a
+    // torn-down source socket whose handshake completes (via a retransmitted
+    // SYN-ACK answered by the old socket's lingering closing TCB) AFTER the
+    // replacement connection was accepted — without this filter that late
+    // accept steals m_current and every real delivery is then discarded until
+    // the next churn cycle (a whole episode can wedge at ~100% frame expiry).
+    void ExpectPeerPort(uint16_t port) { m_expectedPeerPort = port; }
+
+    uint64_t GetCumBytes() const { return m_cumBytes; }
+    bool HasCurrent() const { return m_current != nullptr; }
+
   private:
     void StartApplication() override
     {
@@ -351,8 +443,23 @@ class RealtimeSink : public Application
         }
     }
 
-    void HandleAccept(Ptr<Socket> s, const Address&)
+    void HandleAccept(Ptr<Socket> s, const Address& from)
     {
+        if (m_expectedPeerPort != 0 && InetSocketAddress::IsMatchingType(from) &&
+            InetSocketAddress::ConvertFrom(from).GetPort() != m_expectedPeerPort)
+        {
+            // Stale half-open child of a torn-down (pre-churn) subflow whose
+            // handshake completed late; it must not become the current
+            // connection (see ExpectPeerPort).
+            s->Close();
+            return;
+        }
+        // The intended accept (initial connection or churn-revival reconnect)
+        // supersedes any previous subflow: the watermark accounting restarts
+        // at zero (the controller resets its per-path enqueue counter in
+        // lockstep) and only the current connection feeds it.
+        m_current = s;
+        m_cumBytes = 0;
         s->SetRecvCallback(MakeCallback(&RealtimeSink::HandleRead, this));
     }
 
@@ -366,6 +473,10 @@ class RealtimeSink : public Application
             if (n == 0)
             {
                 break;
+            }
+            if (s != m_current)
+            {
+                continue; // straggler bytes from a torn-down (pre-churn) subflow
             }
             m_cumBytes += n;
             m_onBytes(m_pathIdx, m_cumBytes, Simulator::Now());
@@ -392,12 +503,114 @@ class RealtimeSink : public Application
     }
 
     Ptr<Socket> m_listen;
+    Ptr<Socket> m_current; // accepted subflow currently feeding the counters (TCP mode)
+    uint16_t m_expectedPeerPort = 0; // 0 = accept any (initial/static)
     Address m_bind;
     uint32_t m_pathIdx = 0;
-    uint64_t m_cumBytes = 0; // cumulative bytes delivered since connection (TCP mode)
+    uint64_t m_cumBytes = 0; // cumulative bytes delivered on the current connection (TCP mode)
     Transport m_transport = Transport::Tcp;
     Callback<void, uint32_t, uint64_t, Time> m_onBytes;
     Callback<void, uint32_t, uint64_t, uint32_t, uint32_t, double, Time> m_onDatagram;
+};
+
+// --------------------------------------------------------------------------- //
+// CrossTrafficApp — bursty on/off UDP cross-traffic whose rate can be rescaled
+// mid-run (dynamics mode only). OnOffApplication is NOT safe to rescale: it
+// carries residual-bits bookkeeping across DataRate changes, which drifts when
+// the rate is rescaled while a send is pending and eventually trips its
+// "Calculation to compute next send time will overflow" NS_FATAL (observed
+// after ~1000 s of per-frame rescaling; the shrinking residual also degenerates
+// the app into a line-rate flood just before the abort). Here every packet
+// schedules the next one from the *current* rate — no residual state, so
+// SetRateMultiplier is always safe. The static scenario keeps the stock
+// OnOffApplication so its behavior stays byte-identical.
+// --------------------------------------------------------------------------- //
+
+class CrossTrafficApp : public Application
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("RealtimeMpquic::CrossTrafficApp")
+                                .SetParent<Application>()
+                                .SetGroupName("Applications")
+                                .AddConstructor<CrossTrafficApp>();
+        return tid;
+    }
+
+    void Configure(Address peer,
+                   DataRate baseRate,
+                   double onMeanS,
+                   double offMeanS,
+                   uint32_t pktSize)
+    {
+        m_peer = peer;
+        m_baseRate = baseRate;
+        m_onMeanS = onMeanS;
+        m_offMeanS = offMeanS;
+        m_pktSize = pktSize;
+    }
+
+    // Scale the send rate (regime x burst x corr multiplier); takes effect on
+    // the next scheduled packet.
+    void SetRateMultiplier(double mult) { m_mult = std::max(0.0, mult); }
+
+  private:
+    void StartApplication() override
+    {
+        m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+        m_socket->Bind();
+        m_socket->Connect(m_peer);
+        m_onVar = CreateObject<ExponentialRandomVariable>();
+        m_onVar->SetAttribute("Mean", DoubleValue(m_onMeanS));
+        m_offVar = CreateObject<ExponentialRandomVariable>();
+        m_offVar->SetAttribute("Mean", DoubleValue(m_offMeanS));
+        StartOnPeriod();
+    }
+
+    void StopApplication() override
+    {
+        m_sendEvent.Cancel();
+        if (m_socket)
+        {
+            m_socket->Close();
+            m_socket = nullptr;
+        }
+    }
+
+    void StartOnPeriod()
+    {
+        m_onUntilS = Simulator::Now().GetSeconds() + m_onVar->GetValue();
+        SendOne();
+    }
+
+    void SendOne()
+    {
+        if (Simulator::Now().GetSeconds() >= m_onUntilS)
+        {
+            m_sendEvent = Simulator::Schedule(Seconds(m_offVar->GetValue()),
+                                              &CrossTrafficApp::StartOnPeriod,
+                                              this);
+            return;
+        }
+        m_socket->Send(Create<Packet>(m_pktSize));
+        double bps = std::max(1e3, m_baseRate.GetBitRate() * m_mult);
+        m_sendEvent = Simulator::Schedule(Seconds(m_pktSize * 8.0 / bps),
+                                          &CrossTrafficApp::SendOne,
+                                          this);
+    }
+
+    Ptr<Socket> m_socket;
+    Address m_peer;
+    DataRate m_baseRate;
+    double m_mult = 1.0;
+    double m_onMeanS = 1.0;
+    double m_offMeanS = 1.0;
+    double m_onUntilS = 0.0;
+    uint32_t m_pktSize = 1200;
+    Ptr<ExponentialRandomVariable> m_onVar;
+    Ptr<ExponentialRandomVariable> m_offVar;
+    EventId m_sendEvent;
 };
 
 // --------------------------------------------------------------------------- //
@@ -461,6 +674,9 @@ struct ScenarioConfig
     // e.g. "4,5:0,1". Indices >= numPaths are dropped (this topology has 4
     // paths, so a 6-path config's out-of-range group is simply inactive).
     std::string corrGroups = "";
+
+    // Diagnostic: per-second per-path churn/connection state on stderr.
+    bool churnLog = false;
 };
 
 // --------------------------------------------------------------------------- //
@@ -498,6 +714,11 @@ class RealtimeController
         m_baseRate.resize(n);
         m_baseRttMs.assign(n, 0.0);
         m_maxBufferBytes.assign(n, 0.0);
+        m_errModels.resize(n);
+        m_crossDyn.resize(n);
+        m_lastDeliveryS.assign(n, 0.0);
+        m_prevTxPkts.assign(n, 0);
+        m_prevLostPkts.assign(n, 0);
 
         Ipv4AddressHelper addr;
         for (uint32_t i = 0; i < n; ++i)
@@ -508,6 +729,24 @@ class RealtimeController
             NetDeviceContainer dev = p2p.Install(m_client.Get(0), m_server.Get(0));
             m_devs[i] = dev;
             m_baseRate[i] = DataRate(m_cfg.paths[i].rate);
+            if (m_cfg.dynamicsEnabled)
+            {
+                // Churn liveness is enforced by drop-all receive error models on
+                // BOTH directions (data + ACKs), enabled while the path is out.
+                // Unlike collapsing the link DataRate, packets keep serializing
+                // at the normal rate and die at the receiver, so a revived path
+                // is usable immediately — no packet can strand the device
+                // mid-serialization for seconds after the outage ends.
+                for (uint32_t d = 0; d < 2; ++d)
+                {
+                    Ptr<RateErrorModel> em = CreateObject<RateErrorModel>();
+                    em->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+                    em->SetAttribute("ErrorRate", DoubleValue(1.0));
+                    em->Disable();
+                    dev.Get(d)->SetAttribute("ReceiveErrorModel", PointerValue(em));
+                    m_errModels[i][d] = em;
+                }
+            }
             // Base RTT ~ 2 x one-way propagation delay (ms); a neutral sRTT
             // placeholder reported for churned-out paths (mirrors the mock).
             m_baseRttMs[i] = 2.0 * Time(m_cfg.paths[i].delay).GetSeconds() * 1000.0;
@@ -543,6 +782,14 @@ class RealtimeController
         // m_fmh is a member so the monitor outlives Simulator::Run().
         m_monitor = m_fmh.InstallAll();
         m_classifier = DynamicCast<Ipv4FlowClassifier>(m_fmh.GetClassifier());
+        if (m_cfg.dynamicsEnabled)
+        {
+            // Count a packet as lost once it is a deadline late (real-time
+            // semantics), not FlowMonitor's default 10 s, so the windowed loss
+            // estimate in RefreshNetworkLoss reacts within an app period.
+            m_monitor->SetAttribute("MaxPerHopDelay",
+                                    TimeValue(Seconds(m_cfg.deadlineMs / 1000.0)));
+        }
 
         InitDynamics();
     }
@@ -601,8 +848,13 @@ class RealtimeController
         m_sinks[i] = sink;
 
         Ptr<RealtimeSource> src = CreateObject<RealtimeSource>();
+        // Under dynamics, also cap the TCP send buffer at the deadline-worth
+        // bound so an outage can strand at most ~one deadline of stale bytes.
+        uint32_t sndBuf = m_cfg.dynamicsEnabled
+                              ? static_cast<uint32_t>(m_maxBufferBytes[i])
+                              : 0;
         src->Configure(InetSocketAddress(clientIp, port), i, m_cfg.transport,
-                       m_cfg.deadlineMs / 1000.0);
+                       m_cfg.deadlineMs / 1000.0, sndBuf);
         m_server.Get(0)->AddApplication(src);
         src->SetStartTime(Seconds(0.1)); // after the sink is listening
         m_sources[i] = src;
@@ -619,19 +871,38 @@ class RealtimeController
         ca.Start(Seconds(0.0));
 
         double crossBps = m_cfg.paths[i].crossFrac * linkRate.GetBitRate();
-        OnOffHelper onoff("ns3::UdpSocketFactory", InetSocketAddress(clientIp, port));
-        onoff.SetAttribute("DataRate", DataRateValue(DataRate(static_cast<uint64_t>(crossBps))));
-        onoff.SetAttribute("PacketSize", UintegerValue(1200));
-        // Bursty on/off, phase-shifted per path so available bandwidth varies and
-        // paths peak at different times.
-        std::ostringstream on, off;
-        on << "ns3::ExponentialRandomVariable[Mean=" << (0.6 + 0.2 * i) << "]";
-        off << "ns3::ExponentialRandomVariable[Mean=" << (0.8 + 0.3 * i) << "]";
-        onoff.SetAttribute("OnTime", StringValue(on.str()));
-        onoff.SetAttribute("OffTime", StringValue(off.str()));
-        ApplicationContainer co = onoff.Install(m_server.Get(0));
-        co.Start(Seconds(0.2));
-        m_crossApps.Add(co);
+        if (m_cfg.dynamicsEnabled)
+        {
+            // Rescale-safe custom source (see CrossTrafficApp): ApplyPathRate
+            // scales its rate with the dynamic capacity multiplier every frame.
+            // Same shape as the static OnOff config: bursty on/off, phase-
+            // shifted per path so paths peak at different times.
+            Ptr<CrossTrafficApp> app = CreateObject<CrossTrafficApp>();
+            app->Configure(InetSocketAddress(clientIp, port),
+                           DataRate(static_cast<uint64_t>(crossBps)),
+                           0.6 + 0.2 * i,
+                           0.8 + 0.3 * i,
+                           1200);
+            m_server.Get(0)->AddApplication(app);
+            app->SetStartTime(Seconds(0.2));
+            m_crossDyn[i] = app;
+        }
+        else
+        {
+            OnOffHelper onoff("ns3::UdpSocketFactory", InetSocketAddress(clientIp, port));
+            onoff.SetAttribute("DataRate", DataRateValue(DataRate(static_cast<uint64_t>(crossBps))));
+            onoff.SetAttribute("PacketSize", UintegerValue(1200));
+            // Bursty on/off, phase-shifted per path so available bandwidth varies
+            // and paths peak at different times.
+            std::ostringstream on, off;
+            on << "ns3::ExponentialRandomVariable[Mean=" << (0.6 + 0.2 * i) << "]";
+            off << "ns3::ExponentialRandomVariable[Mean=" << (0.8 + 0.3 * i) << "]";
+            onoff.SetAttribute("OnTime", StringValue(on.str()));
+            onoff.SetAttribute("OffTime", StringValue(off.str()));
+            ApplicationContainer co = onoff.Install(m_server.Get(0));
+            co.Start(Seconds(0.2));
+            m_crossApps.Add(co);
+        }
     }
 
     // -- non-stationary dynamics ------------------------------------------- //
@@ -680,7 +951,12 @@ class RealtimeController
     void ResetDynamicsState()
     {
         const uint32_t n = NumPaths();
-        std::fill(m_active.begin(), m_active.end(), 1);
+        // Revive any dead path through the full transition (error models off,
+        // TCP subflow re-established), not a bare mask flip.
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            if (!m_active[i]) SetPathLive(i, true);
+        }
         std::fill(m_burstUntil.begin(), m_burstUntil.end(), -1.0);
         std::fill(m_corrUntil.begin(), m_corrUntil.end(), -1.0);
         m_corrUntil.assign(m_corrMembers.size(), -1.0);
@@ -708,18 +984,98 @@ class RealtimeController
         return m;
     }
 
-    // Push the current effective capacity onto the NS-3 bottleneck. A churned-out
-    // path collapses to ~0 so its throughput/RTT reflect the outage; its bytes
-    // are additionally dropped at the app layer in GenerateFrame.
+    // Push the current effective capacity onto the NS-3 bottleneck and scale the
+    // cross-traffic source with it, so cross traffic stays a *fraction* of the
+    // current capacity (multiplicative semantics, mirroring the mock's
+    // base*(1-cross)*mult). Liveness is NOT expressed through the rate: a
+    // churned-out path keeps its regime rate and drops packets via the error
+    // models instead (see SetPathLive), so revival takes effect instantly.
     void ApplyPathRate(uint32_t i)
     {
         if (!m_cfg.dynamicsEnabled) return;
-        double mult = PathLive(i) ? CapMult(i) : 1e-4;
+        double mult = CapMult(i);
         uint64_t bps =
             static_cast<uint64_t>(std::max(1e3, m_baseRate[i].GetBitRate() * mult));
         DataRateValue drv{DataRate(bps)};
         m_devs[i].Get(0)->SetAttribute("DataRate", drv);
         m_devs[i].Get(1)->SetAttribute("DataRate", drv);
+        if (m_crossDyn[i])
+        {
+            m_crossDyn[i]->SetRateMultiplier(mult);
+        }
+    }
+
+    // Flip path i's liveness (dynamics only). Dead = drop-all error models on
+    // both directions, so bytes vanish in flight — the packet-level analogue of
+    // the mock's "bytes onto a dead path never arrive". For TCP the subflow is
+    // torn down on the way out (its queued shares are written off as dropped)
+    // and re-established on revival, so no stale send-buffer bytes or RTO
+    // backoff from the outage can stall the path afterwards.
+    void SetPathLive(uint32_t i, bool live)
+    {
+        if ((m_active[i] != 0) == live)
+        {
+            return;
+        }
+        m_active[i] = live ? 1 : 0;
+        if (m_cfg.churnLog)
+        {
+            std::cerr << "[churn] t=" << Simulator::Now().GetSeconds() << " path=" << i
+                      << (live ? " UP" : " DOWN") << " shQ=" << m_shareQ[i].size()
+                      << " pend=" << m_sources[i]->GetPendingBytes()
+                      << " enq=" << m_pathEnq[i] << " cum=" << m_sinks[i]->GetCumBytes()
+                      << "\n";
+        }
+        for (auto& em : m_errModels[i])
+        {
+            if (live) em->Disable(); else em->Enable();
+        }
+        if (m_cfg.transport == Transport::Tcp)
+        {
+            if (live)
+            {
+                // Fresh subflow: the sink zeroes its byte counter on accept, so
+                // the watermark space restarts at zero in lockstep. Pin the
+                // sink to this connection's source port so a stale half-open
+                // child from before the outage can't steal the accept.
+                m_pathEnq[i] = 0;
+                m_sources[i]->Reconnect();
+                m_sinks[i]->ExpectPeerPort(m_sources[i]->GetLocalPort());
+            }
+            else
+            {
+                m_sinks[i]->Invalidate(); // ignore stragglers until the new accept
+                WriteOffPathShares(i);
+                m_sources[i]->Teardown();
+            }
+        }
+        // UDP mode needs no connection handling: in-flight fragments die at the
+        // error model and stale shares are written off by DrainUdp's deadline
+        // check; unresolved frames expire via ExpireLateFrames.
+    }
+
+    // Churn-down: the shares still queued on path i will never arrive (the
+    // subflow is being torn down). Count their bytes as dropped; a frame whose
+    // last outstanding share was here completes immediately with that loss
+    // fraction, exactly like the mock's dropped_frac accounting.
+    void WriteOffPathShares(uint32_t i)
+    {
+        auto& q = m_shareQ[i];
+        while (!q.empty())
+        {
+            ShareEntry e = q.front();
+            q.pop_front();
+            auto it = m_frames.find(e.frameId);
+            if (it == m_frames.end())
+            {
+                continue;
+            }
+            it->second.droppedBytes += e.bytes;
+            if (--it->second.sharesRemaining == 0)
+            {
+                CompleteFrame(it);
+            }
+        }
     }
 
     // Step the machines one frame. Event probabilities convert per-second hazards
@@ -774,10 +1130,43 @@ class RealtimeController
             for (auto v : nxt) live += v;
             for (uint32_t i = 0; i < n && live < m_cfg.minActive; ++i)
                 if (!nxt[i]) { nxt[i] = 1; ++live; }
-            m_active = nxt;
+            // Apply the transitions (error models + TCP teardown/reconnect).
+            for (uint32_t i = 0; i < n; ++i)
+                if ((nxt[i] != 0) != (m_active[i] != 0)) SetPathLive(i, nxt[i] != 0);
         }
         // Reflect the updated multipliers/liveness on the links for the next frame.
         for (uint32_t i = 0; i < n; ++i) ApplyPathRate(i);
+    }
+
+    // Diagnostic (churnLog): one per-path state line per app period. The key
+    // wedge indicator is a live path whose oldest queued share is older than
+    // the deadline (its frames can only expire).
+    void LogPathState(double now)
+    {
+        for (uint32_t i = 0; i < NumPaths(); ++i)
+        {
+            double oldestAge = -1.0;
+            if (!m_shareQ[i].empty())
+            {
+                auto it = m_frames.find(m_shareQ[i].front().frameId);
+                if (it != m_frames.end())
+                {
+                    oldestAge = now - it->second.genTimeS;
+                }
+            }
+            std::cerr << "[pstate] t=" << now << " i=" << i
+                      << " act=" << (int)m_active[i]
+                      << " conn=" << (m_sources[i]->IsConnected() ? 1 : 0)
+                      << " cur=" << (m_sinks[i]->HasCurrent() ? 1 : 0)
+                      << " pend=" << m_sources[i]->GetPendingBytes()
+                      << " occ=" << m_sources[i]->GetBufferOcc()
+                      << " shQ=" << m_shareQ[i].size()
+                      << " oldest=" << oldestAge
+                      << " enq=" << m_pathEnq[i]
+                      << " cum=" << m_sinks[i]->GetCumBytes()
+                      << " thr=" << m_pathThrEwma[i]
+                      << "\n";
+        }
     }
 
     // Register a whole-frame loss (all shares routed onto dead/empty paths), the
@@ -790,6 +1179,11 @@ class RealtimeController
         m_lastJitterMs = 0.0;
         m_lastLoss = 1.0;
         m_lastBytes = 0;
+        if (m_selftest)
+        {
+            ++m_dbgExpired;
+            m_dbgSumLoss += 1.0;
+        }
     }
 
     // -- decision loop ------------------------------------------------------ //
@@ -803,6 +1197,24 @@ class RealtimeController
         if (appDue)
         {
             RefreshNetworkLoss(); // FlowMonitor sweep only on the 1 s cadence (lean per-frame)
+            if (m_cfg.churnLog)
+            {
+                LogPathState(now);
+            }
+        }
+        if (m_cfg.dynamicsEnabled)
+        {
+            // A path that has stopped delivering must not keep reporting its
+            // last healthy goodput: decay the EWMA once it goes quiet for more
+            // than a deadline, so stalls/outages are visible in the observation.
+            const double staleS = m_cfg.deadlineMs / 1000.0;
+            for (uint32_t i = 0; i < NumPaths(); ++i)
+            {
+                if (now - m_lastDeliveryS[i] > staleS)
+                {
+                    m_pathThrEwma[i] *= 0.9;
+                }
+            }
         }
 
         EnvStruct env{};
@@ -819,6 +1231,7 @@ class RealtimeController
                           << " firstLatMs=" << m_dbgFirstCompletedLatMs
                           << " meanLatMs=" << (m_dbgCompleted > 0 ? m_dbgSumLatMs / m_dbgCompleted : 0.0)
                           << " lossRate=" << (double)m_dbgExpired / (m_dbgCompleted + m_dbgExpired)
+                          << " meanLoss=" << (m_dbgSumLoss / (m_dbgCompleted + m_dbgExpired))
                           << "\n";
                 Simulator::Stop();
                 return;
@@ -986,6 +1399,7 @@ class RealtimeController
         double shareDur = std::max(t - fr.genTimeS, 1e-6);
         double gp = (shareBytes * 8.0) / (shareDur * 1e6);
         m_pathThrEwma[pathIdx] = 0.6 * m_pathThrEwma[pathIdx] + 0.4 * gp;
+        m_lastDeliveryS[pathIdx] = t;
 
         if (--fr.sharesRemaining == 0)
         {
@@ -1070,6 +1484,7 @@ class RealtimeController
         {
             ++m_dbgCompleted;
             m_dbgSumLatMs += latencyMs;
+            m_dbgSumLoss += frameLoss;
             if (m_dbgFirstCompletedLatMs < 0.0) m_dbgFirstCompletedLatMs = latencyMs;
             if (m_dbgCompleted + m_dbgExpired <= 30)
                 std::cerr << "[frame] COMPLETE fid=" << fr.genTimeS
@@ -1107,6 +1522,7 @@ class RealtimeController
             m_lastBytes = 0;
             if (m_selftest) {
                 ++m_dbgExpired;
+                m_dbgSumLoss += 1.0;
                 if (m_dbgCompleted + m_dbgExpired <= 30)
                     std::cerr << "[frame] EXPIRE fid=" << it->second.genTimeS
                               << " elapsedMs=" << elapsedMs
@@ -1192,10 +1608,11 @@ class RealtimeController
         }
         m_monitor->CheckForLostPackets();
         auto stats = m_monitor->GetFlowStats();
-        for (uint32_t i = 0; i < NumPaths(); ++i)
-        {
-            m_pathLossCache[i] = 0.0;
-        }
+        const uint32_t n = NumPaths();
+        // Sum tx/lost per path across matching flows: TCP reconnects after churn
+        // create a new five-tuple (fresh source port) for the same path.
+        std::vector<uint64_t> txSum(n, 0);
+        std::vector<uint64_t> lostSum(n, 0);
         for (const auto& kv : stats)
         {
             Ipv4FlowClassifier::FiveTuple ft = m_classifier->FindFlow(kv.first);
@@ -1209,18 +1626,35 @@ class RealtimeController
             {
                 continue;
             }
-            for (uint32_t i = 0; i < NumPaths(); ++i)
+            for (uint32_t i = 0; i < n; ++i)
             {
                 if (ft.destinationAddress == m_clientAddr[i])
                 {
-                    uint64_t tx = kv.second.txPackets;
-                    uint64_t lost = kv.second.lostPackets;
-                    uint64_t denom = tx + lost;
-                    m_pathLossCache[i] =
-                        (denom == 0) ? 0.0
-                                     : std::min(1.0, static_cast<double>(lost) / denom);
+                    txSum[i] += kv.second.txPackets;
+                    lostSum[i] += kv.second.lostPackets;
                 }
             }
+        }
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            uint64_t tx = txSum[i];
+            uint64_t lost = lostSum[i];
+            if (m_cfg.dynamicsEnabled)
+            {
+                // Windowed estimate: loss over the last app period. The
+                // cumulative-since-process-start ratio converges to a
+                // near-constant across episodes and stops carrying signal.
+                uint64_t dTx = (tx >= m_prevTxPkts[i]) ? tx - m_prevTxPkts[i] : 0;
+                uint64_t dLost = (lost >= m_prevLostPkts[i]) ? lost - m_prevLostPkts[i] : 0;
+                m_prevTxPkts[i] = tx;
+                m_prevLostPkts[i] = lost;
+                tx = dTx;
+                lost = dLost;
+            }
+            uint64_t denom = tx + lost;
+            m_pathLossCache[i] =
+                (denom == 0) ? 0.0
+                             : std::min(1.0, static_cast<double>(lost) / denom);
         }
     }
 
@@ -1236,6 +1670,9 @@ class RealtimeController
         m_frames.clear();
         m_pendingFrames.clear();
         m_udpRecvBytes.clear();
+        // Fresh delivery clocks so the staleness decay doesn't trigger from
+        // pre-reset silence (the network state itself stays warm).
+        std::fill(m_lastDeliveryS.begin(), m_lastDeliveryS.end(), now);
         m_frameInEpisode = 0;
         m_episodeStartS = now;
         m_prevLatencyMs = -1.0;
@@ -1268,6 +1705,11 @@ class RealtimeController
     std::vector<DataRate> m_baseRate;
     std::vector<double> m_baseRttMs;
     std::vector<double> m_maxBufferBytes; // per-path app backlog cap (bytes)
+    // Drop-all receive error models, one per direction per path (dynamics only;
+    // enabled while the path is churned out — see SetPathLive).
+    std::vector<std::array<Ptr<RateErrorModel>, 2>> m_errModels;
+    // Cross-traffic sources, rescaled with the capacity multiplier (dynamics only).
+    std::vector<Ptr<CrossTrafficApp>> m_crossDyn;
 
     // Non-stationary dynamics state (mirrors MockRealtimeDataPlane).
     std::vector<uint8_t> m_active;             // per-path liveness (churn)
@@ -1287,6 +1729,11 @@ class RealtimeController
     // Episode-scoped aggregates.
     std::vector<double> m_pathThrEwma;
     std::vector<double> m_pathLossCache;
+    std::vector<double> m_lastDeliveryS; // last share delivery per path (staleness decay)
+    // FlowMonitor cumulative counters at the previous sweep, for the windowed
+    // (per-app-period) loss estimate under dynamics.
+    std::vector<uint64_t> m_prevTxPkts;
+    std::vector<uint64_t> m_prevLostPkts;
     // UDP mode only: per-path RTT-fallback EWMA (2x measured one-way transit
     // delay). Persists warm across episodes, like m_pathThrEwma/m_pathLossCache.
     std::vector<double> m_udpSrttEwmaMs;
@@ -1311,6 +1758,7 @@ class RealtimeController
     uint32_t m_dbgExpired = 0;
     double m_dbgFirstCompletedLatMs = -1.0;
     double m_dbgSumLatMs = 0.0;
+    double m_dbgSumLoss = 0.0; // sum of per-frame loss incl. partial dead-path drops
 
     FlowMonitorHelper m_fmh;
     Ptr<FlowMonitor> m_monitor;
@@ -1388,6 +1836,7 @@ main(int argc, char* argv[])
     cmd.AddValue("corrIntensity", "Capacity multiplier for a failed group", cfg.corrIntensity);
     cmd.AddValue("corrDurationS", "Correlated-failure duration (s)", cfg.corrDurationS);
     cmd.AddValue("corrGroups", "Correlated groups, e.g. \"4,5:0,1\"", cfg.corrGroups);
+    cmd.AddValue("churnLog", "Log per-path churn/connection state (diagnostic)", cfg.churnLog);
     cmd.Parse(argc, argv);
 
     if (!topology.empty())

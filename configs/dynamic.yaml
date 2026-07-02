@@ -1,6 +1,8 @@
 # Non-stationary, variable-path-count scenario — the headline test for the
-# scoring (dynamic-input) Transport agent. Mock-backend only (the NS-3 body has
-# no churn yet; see ns3/realtime_mpquic.h CONTRACT note).
+# scoring (dynamic-input) Transport agent. Runs on both backends: the NS-3 body
+# mirrors these dynamics (churn via drop-all error models, regime/burst/corr
+# scaling the bottleneck + cross-traffic). Behavioral parity is guarded by
+# scripts/parity_check.py; see the CONTRACT note in CLAUDE.md.
 #
 # Design intent: make *which path you send on* an informative, time-varying
 # decision so the split agent actually earns its keep (the static four_path.yaml

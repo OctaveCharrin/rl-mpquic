@@ -67,9 +67,17 @@ the full system; on the dynamic scenario the same App-only ablation *collapses*)
 carries the liveness mask (bound as `e.pathActive(i)`), and `RealtimeController`
 implements churn/regime/burst/correlated failures off the same `DynamicsConfig`
 parameters (forwarded via the `setting` dict → C++ CLI; **off by default** so the
-static NS-3 scenario is byte-identical). Churn collapses the NS-3 link and drops
-app bytes routed onto a dead path (loss); regime/burst/corr scale the per-path
-bottleneck `DataRate`. Keep the mock and C++ in sync when either side changes.
+static NS-3 scenario is byte-identical). Churn is implemented as drop-all receive
+error models on both directions of the link (bytes vanish, like the mock) — NOT
+by collapsing the link `DataRate`, which would strand a packet mid-serialization
+and zombify the path for ~10 s after revival; the TCP subflow is torn down on
+churn-out (queued shares written off as dropped) and reconnected on revival.
+Regime/burst/corr scale the per-path bottleneck `DataRate` **and the cross-traffic
+rate** proportionally (multiplicative semantics, like the mock). App bytes routed
+onto a dead path are dropped at generation (loss). Keep the mock and C++ in sync
+when either side changes; `uv run python scripts/parity_check.py` is the guard —
+it runs the same neutral even-split policy through both backends (mock in-process,
+NS-3 via `--selftest`) and asserts the loss regimes match.
 The `topology:` path list is forwarded too (`Ns3Config.topology` → `paths` CLI
 arg), so a YAML like `configs/dynamic.yaml` drives the same 6-path count on both
 backends and its `corr_groups: [[4,5]]` is in-range under `--backend ns3` (an
