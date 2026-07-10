@@ -1007,18 +1007,26 @@ release) even on exceptions.
 
 `src/train/evaluate.py` rolls out policies *without learning* and reports mean QoE
 and its components. It compares the trained agents (acting deterministically)
-against three scheduling heuristics, all using a common reactive bitrate rule
-(target 90 % of recently measured aggregate goodput) so the comparison isolates
-*scheduling* quality:
+against scheduling heuristics. The `even` / `single` / `proportional` / `random`
+baselines share a common reactive bitrate rule (target 90 % of recently measured
+aggregate goodput) so those comparisons isolate *scheduling* quality:
 
 - **even** — uniform split every frame.
 - **single** — the whole frame on the highest-recent-throughput path.
 - **proportional** — split in proportion to recent per-path throughput.
+- **random** — a fresh Dirichlet-uniform split each frame (seeded).
+- **webrtc** — a realistic end-to-end reference: a stateful WebRTC-style **Google
+  Congestion Control** bitrate estimator (`_GccBitrate`, loss-based + delay-based
+  AIMD; probes for capacity so it does not spiral to the bitrate floor the way the
+  reactive goodput rule can) driving a proportional split.
 - **learned** — the trained App + Path agents.
 
 The rollout reuses the env's `pop_app_window_reward` machinery so the reported QoE
 is computed identically to training. A formatted table prints QoE, VMAF, latency,
-loss, and bitrate per policy.
+loss, and bitrate per policy. With `--ablation` it also adds `app_only` (learned
+bitrate + even split, Path **off**) and `path_only_gcc` (GCC bitrate + learned
+split, App **off**); the latter uses the non-collapsing GCC driver so the learned
+scheduler is measured at a realistic load, against the matched `webrtc` reference.
 
 When the network is dynamic (§5.3.1), the heuristic baselines are **mask-aware**:
 `even`/`single`/`proportional`/`random` all operate over the *active* paths only

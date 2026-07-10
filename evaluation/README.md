@@ -1,7 +1,10 @@
 # Evaluation & Figures
 
 Compare the trained hierarchical controller against the scheduling baselines
-(`even`, `single`, `proportional`) and render an exhaustive figure set.
+(`even`, `single`, `proportional`, `random`, and `webrtc` — a WebRTC-style GCC
+bitrate estimator + proportional split) and render an exhaustive figure set.
+Add `--ablation` (with both checkpoints) for the single-agent variants `app_only`
+and `path_only_gcc` (see `figure12_ablation`).
 
 ## Two steps
 
@@ -45,6 +48,7 @@ Compare the trained hierarchical controller against the scheduling baselines
 | `figure7_split_behavior` | Learned per-path traffic split over time (stacked area) |
 | `figure8_latency_cdf` | Latency CDF per method + deadline-miss-rate bar |
 | `figure9_radar` | Normalized multi-metric radar (QoE / VMAF / low-latency / low-loss / fast-decision) |
+| `figure12_ablation` | Single-agent ablation (`--ablation` only): `learned` vs `app_only` / `path_only_gcc`, with the best heuristic baseline hatched for reference |
 | `summary_table.csv` | Machine-readable per-method summary |
 
 `figure4` and `figure5` are where the hierarchical controller's compute cost

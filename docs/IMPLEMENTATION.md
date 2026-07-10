@@ -414,17 +414,32 @@ update math is otherwise identical to §2.2.
 ### 2.6 Heuristic baselines (`src/train/evaluate.py`)
 
 Non-learned scheduling policies, all **mask-aware** (a churned-out path gets zero
-weight) so they are not handicapped by churn they can't see. Every baseline pairs
-with a common **reactive bitrate rule** (`target = 0.9 × recent aggregate goodput`,
-clamped) so comparisons isolate *scheduling* quality:
+weight) so they are not handicapped by churn they can't see. The `even` / `single`
+/ `proportional` / `random` baselines pair with a common **reactive bitrate rule**
+(`target = 0.9 × recent aggregate goodput`, clamped, `_heuristic_bitrate`) so
+comparisons isolate *scheduling* quality:
 
-| Baseline | Split rule |
-|---|---|
-| `even` | uniform over active paths |
-| `single` | whole frame on the highest recent-throughput active path (argmax) |
-| `proportional` | ∝ recent per-path throughput (active only) |
-| `random` | fresh Dirichlet-uniform split over active paths each frame (seeded) |
-| `learned` | trained App + Path agents, acting **deterministically** |
+| Baseline | Bitrate rule | Split rule |
+|---|---|---|
+| `even` | reactive goodput | uniform over active paths |
+| `single` | reactive goodput | whole frame on the highest recent-throughput active path (argmax) |
+| `proportional` | reactive goodput | ∝ recent per-path throughput (active only) |
+| `random` | reactive goodput | fresh Dirichlet-uniform split over active paths each frame (seeded) |
+| `webrtc` | **GCC** (`_GccBitrate`) | ∝ recent per-path throughput (active only) |
+| `learned` | trained App agent | trained Path agent (**deterministic**) |
+
+**`webrtc`** is a realistic reference: a stateful WebRTC-style **Google Congestion
+Control** bandwidth estimator (`_GccBitrate`) driving a proportional multipath
+split. Each App tick (≈ `app_period_s`, matching GCC's ~1 s update period) it
+runs the two classic GCC controllers and takes the more conservative move — the
+**loss-based** rule (`loss > 10%` → `est *= (1 − 0.5·loss)`; `loss < 2%` →
+eligible to increase) and a **delay-based** rule (queuing delay = RTT over the
+tracked min-RTT past 50 ms → back off to `0.85 × received rate`) — otherwise
+increasing by 8% (`est *= 1.08`). Because it carries its own estimate and only
+reads goodput on the delay-back-off branch, it **probes** for capacity and never
+spirals to the bitrate floor the way the reactive goodput rule does (§4.3). It is
+stateful, so each policy gets its own instance and `_rollout` re-arms it per
+episode via a `reset()` hook.
 
 The learned policy is reconstructed by `_learned_policies`, which reads the
 Path checkpoint's `arch` tag to rebuild the flat or scoring agent and feed it
@@ -579,23 +594,36 @@ first-call latency.
 
 ### 4.2 The baseline comparison (always run)
 
-`even`, `single`, `proportional`, `random` (§2.6), plus `learned` **iff** both
-`--app` and `--path` checkpoints are supplied (otherwise baselines-only). This
-isolates **scheduling quality** because all share the same reactive bitrate rule.
-Expected reading: on a no-dominant-path topology `single` is quality-capped (no one
-path saturates VMAF), `proportional` eats the latency-trap path's delay, and
-`learned` aggregates capacity while down-weighting high-RTT/queue paths.
+`even`, `single`, `proportional`, `random` (reactive bitrate) and `webrtc` (GCC
+bitrate), plus `learned` **iff** both `--app` and `--path` checkpoints are supplied
+(otherwise baselines-only). The reactive-bitrate baselines isolate **scheduling
+quality** because they share the same bitrate rule; `webrtc` is the realistic
+end-to-end reference (GCC + proportional split). Expected reading: on a
+no-dominant-path topology `single` is quality-capped (no one path saturates VMAF),
+`proportional` eats the latency-trap path's delay, and `learned` aggregates
+capacity while down-weighting high-RTT/queue paths.
 
 ### 4.3 The ablation study (`--ablation`, requires both checkpoints)
 
-Adds two single-agent variants that disable exactly one learned agent by swapping in
-its heuristic counterpart, to isolate each agent's marginal contribution:
+Adds single-agent variants that disable exactly one learned agent by swapping in a
+heuristic counterpart, to isolate each agent's marginal contribution:
 
 | Variant | Bitrate source | Split source | Isolates | Compare against |
 |---|---|---|---|---|
-| `path_only` | reactive heuristic (App **off**) | learned split | value of the **learned scheduler** | `even` / `proportional` |
 | `app_only` | learned bitrate | `even` split (Path **off**) | value of the **learned bitrate** | `even` (same split, heuristic vs learned bitrate) |
+| `path_only_gcc` | **GCC** (App **off**) | learned split | value of the **learned scheduler** | `webrtc` (same GCC bitrate + proportional split) |
 | `learned` | learned | learned | full system | all of the above |
+
+**Why the App-off ablation uses GCC, not the reactive goodput rule.** The reactive
+bitrate rule (`0.9 × recent goodput`) is a *feedback loop*: a split that
+under-utilizes the network delivers few bytes → low goodput → low bitrate → even
+fewer bytes offered, a self-reinforcing spiral down to `min_bitrate_kbps` (the VMAF
+floor). Paired with the learned split it traps the whole variant at the floor and
+**masks** the scheduler's contribution (an earlier `path_only` variant sat at the
+even-split floor regardless of scheduling skill). Swapping in the GCC driver
+(§2.6) — which probes for capacity and holds a realistic load — lets the learned
+split run at a sensible bitrate, so the QoE gap vs. the matched `webrtc` reference
+(same GCC bitrate, proportional split) reflects scheduling quality alone.
 
 **The headline result the ablation is designed to expose.** On the *static*
 four-path topology, `app_only` reaches ~98% of the full system's QoE — the optimal
