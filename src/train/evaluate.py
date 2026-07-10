@@ -64,6 +64,37 @@ def _heuristic_bitrate(cfg: ExperimentConfig) -> BitrateFn:
     return fn
 
 
+def _capacity_bitrate(cfg: ExperimentConfig) -> BitrateFn:
+    """Capacity-based bitrate that does **not** self-collapse.
+
+    The reactive :func:`_heuristic_bitrate` keys off *achieved goodput*
+    (``throughput_mbps``), so a split that under-utilizes the network delivers
+    few bytes -> low goodput -> low bitrate -> even fewer bytes offered: a
+    self-reinforcing spiral down to ``min_bitrate_kbps`` (the VMAF floor). That
+    traps any spread/even-like split at the floor regardless of scheduling
+    skill, which is exactly what confounds the ``path_only`` ablation.
+
+    This heuristic instead estimates *available* capacity from transport state:
+    per live path the bandwidth-delay-product delivery rate ``cwnd / sRTT``
+    (bits / s), summed across live paths. The congestion window reflects the
+    path's pipe, not how much the app happened to offer, so the estimate holds
+    up when the current split leaves capacity idle -> no death spiral. Bitrate
+    is set to 90% of the aggregate estimate, matching the goodput heuristic's
+    headroom factor.
+    """
+
+    def fn(obs: FrameObs) -> float:
+        m = _active_mask(obs)
+        cwnd_bytes = np.asarray(obs.cwnd, dtype=np.float64) * m
+        srtt_s = np.clip(np.asarray(obs.srtt_ms, dtype=np.float64), 1e-3, None) / 1000.0
+        rate_mbps = (cwnd_bytes * 8.0) / srtt_s / 1e6  # per-path BDP delivery rate
+        cap_mbps = float(rate_mbps.sum())
+        target = 0.9 * cap_mbps * 1000.0  # 90% of estimated capacity (kbps)
+        return cfg.video.clamp_bitrate(max(cfg.video.min_bitrate_kbps, target))
+
+    return fn
+
+
 def _active_mask(obs: FrameObs) -> np.ndarray:
     """Boolean-as-float live-path mask; all-ones when the backend reports none."""
     pa = obs.path_active
@@ -310,6 +341,18 @@ def run_evaluation(
       learned per-path split. Compare to ``even`` / ``proportional``.
     * ``app_only``  -- Path agent disabled: learned bitrate + even
       split. Compare to ``even`` (same split, heuristic vs learned bitrate).
+
+    The reactive goodput heuristic self-collapses to the bitrate floor under any
+    split that under-utilizes the network (goodput -> bitrate -> goodput
+    spiral), which traps ``path_only`` at the floor and masks the Path agent's
+    scheduling skill. Two extra variants isolate the split under a
+    *capacity-based* bitrate (:func:`_capacity_bitrate`, keyed off ``cwnd/sRTT``)
+    that does not collapse, so both offer the same realistic load and the QoE
+    gap reflects scheduling quality alone:
+
+    * ``path_only_cap`` -- capacity-based bitrate + learned split.
+    * ``proportional_cap`` -- capacity-based bitrate + proportional split
+      (the matched-bitrate reference for ``path_only_cap``).
     """
     if use_learned_vmaf is not None:
         cfg.use_learned_vmaf = bool(use_learned_vmaf)
@@ -339,6 +382,14 @@ def run_evaluation(
             # Disable one agent at a time by substituting its heuristic.
             policies["path_only"] = (bitrate_heur, learned_split)  # App off
             policies["app_only"] = (learned_bitrate, _even_split)  # Path off
+            # Non-collapsing variants: capacity-based bitrate so the learned
+            # split runs at a realistic load and its scheduling contribution is
+            # not masked by the goodput heuristic's floor spiral. proportional
+            # is the matched-bitrate reference (same capacity bitrate, hand-
+            # crafted throughput-proportional split).
+            bitrate_cap = _capacity_bitrate(cfg)
+            policies["path_only_cap"] = (bitrate_cap, learned_split)
+            policies["proportional_cap"] = (bitrate_cap, _proportional)
 
     summary: Dict[str, Dict] = {}
     distributions: Dict[str, Dict] = {}

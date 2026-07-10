@@ -71,6 +71,8 @@ DISPLAY = {
     "learned": "Hierarchical RL (Ours)",
     "app_only": "App Agent Only",
     "path_only": "Path Agent Only",
+    "path_only_cap": "Path Agent Only (cap. bitrate)",
+    "proportional_cap": "Proportional (cap. bitrate)",
     "even": "Even Split",
     "single": "Single Best",
     "proportional": "Proportional",
@@ -79,12 +81,19 @@ COLORS = {
     "learned": "#1f77b4",
     "app_only": "#17becf",
     "path_only": "#9467bd",
+    "path_only_cap": "#7b3fbf",
+    "proportional_cap": "#e377c2",
     "even": "#ff7f0e",
     "single": "#2ca02c",
     "proportional": "#d62728",
 }
-# Ablation variants (one learned agent disabled), in display order.
-ABLATION_ORDER = ("learned", "app_only", "path_only")
+# Ablation variants (one learned agent disabled), in display order. The ``_cap``
+# variants run the learned split under a non-collapsing capacity-based bitrate
+# (proportional_cap is their matched-bitrate heuristic reference).
+ABLATION_ORDER = ("learned", "app_only", "path_only", "path_only_cap", "proportional_cap")
+# Which ablation entries actually involve a learned agent (drawn solid; the pure
+# heuristic references in the ablation panel are hatched).
+_LEARNED_ABLATIONS = frozenset({"learned", "app_only", "path_only", "path_only_cap"})
 _FALLBACK_COLORS = ["#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
 
 
@@ -547,7 +556,7 @@ def fig_ablation(summary, fig_dir):
         errs = [err(m) for m in show] if err else None
         bars = ax.bar(x, vals, yerr=errs, capsize=3, color=[col(m) for m in show])
         for bar, m, edge in zip(bars, show, _bar_edges(show)):
-            bar.set(**edge, hatch="" if m in ABLATION_ORDER else "//")
+            bar.set(**edge, hatch="" if m in _LEARNED_ABLATIONS else "//")
         ax.set_xticks(x)
         ax.set_xticklabels([disp(m) for m in show], rotation=35, ha="right")
         ax.set_ylabel(ylabel)
