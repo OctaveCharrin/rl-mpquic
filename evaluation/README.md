@@ -12,7 +12,7 @@ Compare the trained hierarchical controller against the scheduling baselines
    ```bash
    # learned vs baselines (needs trained checkpoints)
    uv run python evaluate.py --backend mock \
-       --app runs/<ts>/app.pth --transport runs/<ts>/transport.pth \
+       --app runs/<ts>/app.pth --path runs/<ts>/path.pth \
        --episodes 5 --out runs/eval-001
 
    # baselines only (graceful fallback — no checkpoints needed)
@@ -39,7 +39,7 @@ Compare the trained hierarchical controller against the scheduling baselines
 | `figure1_qoe` | App-agent QoE per method (mean ± std) — the headline metric |
 | `figure2_metric_panels` | VMAF, latency (p50/p95 vs deadline), loss / deadline-miss |
 | `figure3_qoe_distribution` | QoE distribution (box plot, real per-window samples) |
-| `figure4_decision_time` | **Decision/inference time per method** (App vs Transport, log scale) + per-frame split-time box plot |
+| `figure4_decision_time` | **Decision/inference time per method** (App vs Path, log scale) + per-frame split-time box plot |
 | `figure5_quality_vs_cost` | QoE vs decision time — the quality/compute Pareto view |
 | `figure6_timeseries` | Representative episode: bitrate, throughput, latency, loss over time |
 | `figure7_split_behavior` | Learned per-path traffic split over time (stacked area) |

@@ -6,7 +6,7 @@ from src.ns3env.learned_vmaf import load_learned_vmaf_fn
 from src.ns3env.qoe import (
     QoEWeights,
     compute_qoe_reward,
-    compute_transport_reward,
+    compute_path_reward,
     qoe_components,
     vmaf_for_kbps,
 )
@@ -44,10 +44,10 @@ def test_qoe_bounds():
     assert -2.0 <= r <= 1.0
 
 
-def test_transport_reward_excludes_quality_but_punishes_loss():
+def test_path_reward_excludes_quality_but_punishes_loss():
     w = QoEWeights()
-    clean = compute_transport_reward(latency_ms=20, jitter_ms=2, loss=0.0, weights=w)
-    lossy = compute_transport_reward(latency_ms=20, jitter_ms=2, loss=1.0, weights=w)
+    clean = compute_path_reward(latency_ms=20, jitter_ms=2, loss=0.0, weights=w)
+    lossy = compute_path_reward(latency_ms=20, jitter_ms=2, loss=1.0, weights=w)
     assert clean > lossy
     assert -2.0 <= lossy <= 1.0
 

@@ -4,10 +4,10 @@ Hierarchical real-time video environment.
 Wraps a :class:`~src.ns3env.dataplane.DataPlane` and exposes the two timescales
 the dual-agent controller needs:
 
-* **Transport agent (every frame):** observes per-path transport state + the
+* **Path agent (every frame):** observes per-path transport state + the
   App agent's current target bitrate; its action (a per-path split) is applied to
   the frame, and it is rewarded per frame for delivering that frame quickly and
-  intact (:func:`compute_transport_reward`).
+  intact (:func:`compute_path_reward`).
 * **App agent (every ``app_period_s``):** observes the aggregate app state; its
   action (a target bitrate) persists across frames, and it is rewarded over the
   *window* of frames it governed by the VMAF-based QoE
@@ -32,16 +32,16 @@ from .qoe import (
     QoEWeights,
     VmafFn,
     compute_qoe_reward,
-    compute_transport_reward,
+    compute_path_reward,
     qoe_components,
 )
 from .video_source import VideoSourceConfig
 
-# Per-path transport feature count in the (flat) transport observation.
+# Per-path feature count in the (flat) path-agent observation.
 _PATH_FEATURES = 5
-# Global feature count prepended to the transport observation.
+# Global feature count prepended to the path-agent observation.
 _TRANSPORT_GLOBAL = 4
-# Per-path feature count in the *structured* (scoring) transport state: the five
+# Per-path feature count in the *structured* (scoring) path state: the five
 # flat per-path features plus the liveness flag.
 _PATH_FEATURES_SCORING = _PATH_FEATURES + 1
 # App observation feature count. The policy is horizon-agnostic: it sees only
@@ -63,14 +63,14 @@ class StepInfo:
     jitter_ms: float
     loss: float
     bytes_delivered: int
-    transport_reward: float
+    path_reward: float
 
 
 @dataclass
-class TransportState:
-    """Structured (set-shaped) transport observation for the scoring agent.
+class PathState:
+    """Structured (set-shaped) per-path observation for the scoring path agent.
 
-    Unlike the flat ``build_transport_obs`` vector, this keeps the per-path rows
+    Unlike the flat ``build_path_obs`` vector, this keeps the per-path rows
     *separate* so a permutation-equivariant policy can score a variable / changing
     set of paths. ``glob`` is the same aggregate context the flat observation
     prepends; ``paths`` is one row per candidate path; ``mask`` is the liveness
@@ -123,21 +123,21 @@ class HierarchicalRealtimeEnv:
         return _APP_FEATURES
 
     @property
-    def transport_obs_dim(self) -> int:
+    def path_obs_dim(self) -> int:
         return _TRANSPORT_GLOBAL + _PATH_FEATURES * self.num_paths
 
     @property
-    def transport_global_dim(self) -> int:
-        """Global-context width for the scoring (structured) transport state."""
+    def path_global_dim(self) -> int:
+        """Global-context width for the scoring (structured) path state."""
         return _TRANSPORT_GLOBAL
 
     @property
-    def transport_path_dim(self) -> int:
-        """Per-path feature width for the scoring (structured) transport state."""
+    def path_feat_dim(self) -> int:
+        """Per-path feature width for the scoring (structured) path state."""
         return _PATH_FEATURES_SCORING
 
     @property
-    def transport_act_dim(self) -> int:
+    def path_act_dim(self) -> int:
         return self.num_paths
 
     # -- lifecycle ---------------------------------------------------------- #
@@ -177,7 +177,7 @@ class HierarchicalRealtimeEnv:
             dtype=np.float32,
         )
 
-    def build_transport_obs(
+    def build_path_obs(
         self, obs: Optional[FrameObs] = None, target_bitrate_kbps: Optional[float] = None
     ) -> np.ndarray:
         o = obs or self.obs
@@ -201,12 +201,12 @@ class HierarchicalRealtimeEnv:
             )
         return np.array(feats, dtype=np.float32)
 
-    def build_transport_state(
+    def build_path_state(
         self, obs: Optional[FrameObs] = None, target_bitrate_kbps: Optional[float] = None
-    ) -> TransportState:
-        """Structured transport observation for the scoring (dynamic-input) agent.
+    ) -> PathState:
+        """Structured per-path observation for the scoring (dynamic-input) agent.
 
-        Same normalized features as :meth:`build_transport_obs`, but kept as a
+        Same normalized features as :meth:`build_path_obs`, but kept as a
         ``(glob, paths, mask)`` triple so a permutation-equivariant policy can
         handle a variable / changing path set. The per-path row carries the five
         flat features plus the liveness flag; ``mask`` mirrors that flag (1.0 when
@@ -238,16 +238,16 @@ class HierarchicalRealtimeEnv:
                 _clip(_at(o.path_loss, i)),
                 mask[i],
             ]
-        return TransportState(glob=glob, paths=paths, mask=mask)
+        return PathState(glob=glob, paths=paths, mask=mask)
 
     # -- stepping ----------------------------------------------------------- #
 
     def step(
         self, target_bitrate_kbps: float, split_ratio: Sequence[float]
     ) -> Tuple[FrameObs, float, bool, StepInfo]:
-        """Apply one frame; return (next_obs, transport_reward, done, info)."""
+        """Apply one frame; return (next_obs, path_reward, done, info)."""
         result: FrameResult = self.dp.step_frame(target_bitrate_kbps, split_ratio)
-        t_reward = compute_transport_reward(
+        p_reward = compute_path_reward(
             latency_ms=result.latency_ms,
             jitter_ms=result.jitter_ms,
             loss=result.loss,
@@ -265,9 +265,9 @@ class HierarchicalRealtimeEnv:
             jitter_ms=result.jitter_ms,
             loss=result.loss,
             bytes_delivered=result.bytes_delivered,
-            transport_reward=t_reward,
+            path_reward=p_reward,
         )
-        return self._obs, t_reward, self.dp.is_done(), info
+        return self._obs, p_reward, self.dp.is_done(), info
 
     # -- App-reward window -------------------------------------------------- #
 

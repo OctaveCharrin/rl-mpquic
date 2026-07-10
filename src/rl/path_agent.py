@@ -1,10 +1,10 @@
 """
-Transport agent: picks the per-path traffic split every frame.
+Path agent: picks the per-path traffic split every frame.
 
 Two interchangeable backends, selected by ``arch``:
 
 * ``"flat"`` (legacy, default) — a fixed-dimension :class:`SACAgent` over the flat
-  transport observation; its ``num_paths``-D normalized action is softmaxed into a
+  per-path observation; its ``num_paths``-D normalized action is softmaxed into a
   split. Locked to a fixed path count.
 * ``"scoring"`` — a permutation-equivariant :class:`ScoringSACAgent` over the
   structured ``(glob, paths, mask)`` state, which handles a variable / changing
@@ -26,7 +26,7 @@ from .scoring_sac_agent import ScoringSACAgent
 _NEG_FILL = -1e30
 
 
-class TransportAgent:
+class PathAgent:
     """SAC controller for the per-path traffic-split ratio (flat or scoring)."""
 
     def __init__(
@@ -52,7 +52,7 @@ class TransportAgent:
         elif self.arch == "flat":
             self.sac = SACAgent(obs_dim, act_dim=self.num_paths, config=config)
         else:
-            raise ValueError(f"unknown transport arch {arch!r} (use 'flat' or 'scoring')")
+            raise ValueError(f"unknown path-agent arch {arch!r} (use 'flat' or 'scoring')")
 
     # -- split mapping ------------------------------------------------------ #
 
@@ -78,7 +78,7 @@ class TransportAgent:
 
     def select(self, obs, deterministic: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """Return (split, raw_action). ``obs`` is a flat vector (flat arch) or a
-        ``TransportState`` (scoring arch)."""
+        ``PathState`` (scoring arch)."""
         if self.arch == "scoring":
             raw = self.sac.select_action(
                 obs.glob, obs.paths, obs.mask, deterministic=deterministic

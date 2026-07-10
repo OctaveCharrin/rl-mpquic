@@ -1,4 +1,4 @@
-"""Tests for the scoring (dynamic-input) transport agent and structured buffer."""
+"""Tests for the scoring (dynamic-input) path agent and structured buffer."""
 
 import numpy as np
 import torch
@@ -6,8 +6,8 @@ import torch
 from src.rl.replay_buffer import StructuredReplayBuffer
 from src.rl.sac_agent import SACConfig
 from src.rl.scoring_sac_agent import ScoringGaussianPolicy, ScoringQNetwork, ScoringSACAgent
-from src.rl.transport_agent import TransportAgent
-from src.ns3env.realtime_env import TransportState
+from src.rl.path_agent import PathAgent
+from src.ns3env.realtime_env import PathState
 
 G, F = 4, 6
 
@@ -15,7 +15,7 @@ G, F = 4, 6
 def _state(n, mask=None, rng=None):
     rng = rng or np.random.default_rng(0)
     m = np.ones(n, dtype=np.float32) if mask is None else np.asarray(mask, np.float32)
-    return TransportState(
+    return PathState(
         glob=rng.random(G).astype(np.float32),
         paths=rng.random((n, F)).astype(np.float32),
         mask=m,
@@ -35,7 +35,7 @@ def test_policy_variable_n_shapes():
 
 
 def test_masked_split_zeros_inactive():
-    agent = TransportAgent(
+    agent = PathAgent(
         obs_dim=0, num_paths=5, arch="scoring", global_dim=G, path_dim=F,
         config=SACConfig(start_steps=0),
     )

@@ -66,10 +66,10 @@ class ExperimentConfig:
     seed: int = 1
     cap_mbps: float = 10.0
     out_dir: str = "runs"
-    # Transport-agent architecture: "flat" (legacy fixed-dim MLP SAC) or
+    # Path-agent architecture: "flat" (legacy fixed-dim MLP SAC) or
     # "scoring" (permutation-equivariant, variable-path-count SAC). "flat" is the
     # default so existing configs/checkpoints are unaffected.
-    transport_arch: str = "flat"
+    path_arch: str = "flat"
     # Per-path transport backend for the NS-3 scenario: "tcp" (default) or "udp"
     # (explicit app-layer deadline-drop instead of TCP retransmission). Ignored
     # by the mock backend, which is already UDP-like.
@@ -204,7 +204,7 @@ def load_config(path: Optional[str] = None) -> ExperimentConfig:
     cfg.seed = int(run.get("seed", 1))
     cfg.cap_mbps = float(run.get("cap_mbps", 10.0))
     cfg.out_dir = str(run.get("out_dir", "runs"))
-    cfg.transport_arch = str(run.get("transport_arch", sac.get("transport_arch", "flat")))
+    cfg.path_arch = str(run.get("path_arch", sac.get("path_arch", "flat")))
     cfg.transport = str(run.get("transport", "tcp"))
 
     cfg.dynamics = _parse_dynamics(data.get("dynamics"))

@@ -6,7 +6,7 @@ method:
 
 * aggregate QoE / VMAF / latency / jitter / loss / bitrate / throughput stats,
 * the **decision (inference) time** of each agent call — App-bitrate and
-  Transport-split — so the learned controller's compute cost can be compared to
+  Path-split — so the learned controller's compute cost can be compared to
   the cheap heuristics,
 * raw per-frame distributions (for box/CDF plots), and
 * one representative per-frame time-series trace (for time-series/split plots).
@@ -22,7 +22,7 @@ Baselines:
 * ``single``      — send the whole frame on the highest-throughput path.
 * ``proportional``— split in proportion to recent per-path throughput.
 * ``random``      — a fresh uniform-over-simplex split every frame (seeded).
-* ``learned``     — the trained App + Transport agents, acting deterministically.
+* ``learned``     — the trained App + Path agents, acting deterministically.
 
 Baselines use a reactive bitrate heuristic (90% of recent aggregate goodput) so
 the comparison reflects scheduling quality, not a frozen bitrate.
@@ -40,7 +40,7 @@ import numpy as np
 from ..ns3env.dataplane import FrameObs
 from ..ns3env.realtime_env import HierarchicalRealtimeEnv
 from ..rl.app_agent import AppAgent
-from ..rl.transport_agent import TransportAgent
+from ..rl.path_agent import PathAgent
 from .config import ExperimentConfig
 
 BitrateFn = Callable[[FrameObs], float]
@@ -51,7 +51,7 @@ _TRACE_SCALARS = ("t", "latency_ms", "loss", "jitter_ms", "bitrate_kbps", "throu
 # Distribution fields aggregated across all episodes (for box/CDF plots).
 _DIST_FIELDS = (
     "qoe", "vmaf", "latency_ms", "jitter_ms", "loss", "bitrate_kbps",
-    "throughput_mbps", "app_decision_ms", "transport_decision_ms",
+    "throughput_mbps", "app_decision_ms", "path_decision_ms",
     "active_paths", "split_entropy",
 )
 
@@ -129,7 +129,7 @@ def _rollout(
     """One episode; returns aggregate metrics + per-frame trace + timings.
 
     Decision time is measured around the policy callables only (the App-bitrate
-    and Transport-split calls), so for the learned policy it captures the
+    and Path-split calls), so for the learned policy it captures the
     observation-build + network forward pass, and for the baselines the cheap
     heuristic compute — i.e. the real cost each method pays to make a decision.
     """
@@ -146,7 +146,7 @@ def _rollout(
     pthr_tr: List[List[float]] = []
     psrtt_tr: List[List[float]] = []  # per-path sRTT (ms)
     ploss_tr: List[List[float]] = []  # per-path loss
-    tdec: List[float] = []          # transport decision ms (every frame)
+    tdec: List[float] = []          # path decision ms (every frame)
     actpaths: List[float] = []      # number of live paths per frame
     spent: List[float] = []         # split entropy (nats) per frame
     # Per-window (App cadence).
@@ -166,7 +166,7 @@ def _rollout(
 
         split, t_ms = _timed(split_fn, obs, target)
         tdec.append(t_ms)
-        next_obs, _t_r, done, info = env.step(target, split)
+        next_obs, _p_r, done, info = env.step(target, split)
 
         # Dynamics diagnostics: how many paths are live, and how concentrated the
         # split is (entropy in nats; 0 = one path, ln(k) = even over k paths).
@@ -205,7 +205,7 @@ def _rollout(
             "path_throughput_mbps": pthr_tr,
             "path_srtt_ms": psrtt_tr,
             "path_loss": ploss_tr,
-            "transport_decision_ms": tdec,
+            "path_decision_ms": tdec,
         },
         "dist": {
             "qoe": win_qoe,
@@ -216,7 +216,7 @@ def _rollout(
             "bitrate_kbps": br,
             "throughput_mbps": thr,
             "app_decision_ms": app_dec,
-            "transport_decision_ms": tdec,
+            "path_decision_ms": tdec,
             "active_paths": actpaths,
             "split_entropy": spent,
         },
@@ -224,7 +224,7 @@ def _rollout(
     }
 
 
-def _learned_policies(env, app_path, transport_path, cfg):
+def _learned_policies(env, app_path, path_ckpt, cfg):
     """Build deterministic bitrate/split fns from trained checkpoints."""
     import torch
 
@@ -236,30 +236,30 @@ def _learned_policies(env, app_path, transport_path, cfg):
     )
     app.sac.load_state_dict(torch.load(app_path, map_location="cpu"))
 
-    # The Transport checkpoint dictates the architecture (a scoring agent tags its
+    # The Path checkpoint dictates the architecture (a scoring agent tags its
     # state dict with "arch"); a legacy flat checkpoint has no such key.
-    t_sd = torch.load(transport_path, map_location="cpu")
-    arch = t_sd.get("arch", "flat") if isinstance(t_sd, dict) else "flat"
+    p_sd = torch.load(path_ckpt, map_location="cpu")
+    arch = p_sd.get("arch", "flat") if isinstance(p_sd, dict) else "flat"
     if arch == "scoring":
-        transport = TransportAgent(
-            env.transport_obs_dim, env.num_paths, config=cfg.sac, arch="scoring",
-            global_dim=env.transport_global_dim, path_dim=env.transport_path_dim,
+        path_agent = PathAgent(
+            env.path_obs_dim, env.num_paths, config=cfg.sac, arch="scoring",
+            global_dim=env.path_global_dim, path_dim=env.path_feat_dim,
         )
     else:
-        transport = TransportAgent(env.transport_obs_dim, env.num_paths, config=cfg.sac)
-    transport.sac.load_state_dict(t_sd)
+        path_agent = PathAgent(env.path_obs_dim, env.num_paths, config=cfg.sac)
+    path_agent.sac.load_state_dict(p_sd)
 
     def bitrate_fn(obs: FrameObs) -> float:
         kbps, _ = app.select(env.build_app_obs(obs), deterministic=True)
         return kbps
 
     def split_fn(obs: FrameObs, target: float) -> np.ndarray:
-        t_obs = (
-            env.build_transport_state(obs, target)
+        p_obs = (
+            env.build_path_state(obs, target)
             if arch == "scoring"
-            else env.build_transport_obs(obs, target)
+            else env.build_path_obs(obs, target)
         )
-        split, _ = transport.select(t_obs, deterministic=True)
+        split, _ = path_agent.select(p_obs, deterministic=True)
         return split
 
     return bitrate_fn, split_fn
@@ -286,7 +286,7 @@ def run_evaluation(
     episodes: int = 5,
     seed: int = 1000,
     app_ckpt: Optional[str] = None,
-    transport_ckpt: Optional[str] = None,
+    path_ckpt: Optional[str] = None,
     show_output: bool = False,
     out_dir: Optional[str] = None,
     save_json: bool = True,
@@ -306,9 +306,9 @@ def run_evaluation(
     disable one learned agent by swapping in its heuristic counterpart, to
     isolate each agent's contribution:
 
-    * ``transport_only`` -- App agent disabled: reactive heuristic bitrate +
+    * ``path_only`` -- App agent disabled: reactive heuristic bitrate +
       learned per-path split. Compare to ``even`` / ``proportional``.
-    * ``app_only``       -- Transport agent disabled: learned bitrate + even
+    * ``app_only``  -- Path agent disabled: learned bitrate + even
       split. Compare to ``even`` (same split, heuristic vs learned bitrate).
     """
     if use_learned_vmaf is not None:
@@ -330,15 +330,15 @@ def run_evaluation(
         "proportional": (bitrate_heur, _proportional),
         "random": (bitrate_heur, _random_split(seed)),
     }
-    if app_ckpt and transport_ckpt:
+    if app_ckpt and path_ckpt:
         learned_bitrate, learned_split = _learned_policies(
-            env, app_ckpt, transport_ckpt, cfg
+            env, app_ckpt, path_ckpt, cfg
         )
         policies["learned"] = (learned_bitrate, learned_split)
         if ablation:
             # Disable one agent at a time by substituting its heuristic.
-            policies["transport_only"] = (bitrate_heur, learned_split)  # App off
-            policies["app_only"] = (learned_bitrate, _even_split)       # Transport off
+            policies["path_only"] = (bitrate_heur, learned_split)  # App off
+            policies["app_only"] = (learned_bitrate, _even_split)  # Path off
 
     summary: Dict[str, Dict] = {}
     distributions: Dict[str, Dict] = {}
@@ -378,7 +378,7 @@ def run_evaluation(
                 "bitrate_kbps": _stats(agg["bitrate_kbps"]),
                 "throughput_mbps": _stats(agg["throughput_mbps"]),
                 "app_decision_ms": _stats(agg["app_decision_ms"]),
-                "transport_decision_ms": _stats(agg["transport_decision_ms"]),
+                "path_decision_ms": _stats(agg["path_decision_ms"]),
                 "active_paths": _stats(agg["active_paths"]),
                 "split_entropy": _stats(agg["split_entropy"]),
                 "deadline_miss_rate": float(
@@ -395,7 +395,7 @@ def run_evaluation(
                 "latency_ms": s["latency_ms"]["mean"],
                 "loss": s["loss"]["mean"],
                 "bitrate_kbps": s["bitrate_kbps"]["mean"],
-                "decision_ms": s["transport_decision_ms"]["p50"],
+                "decision_ms": s["path_decision_ms"]["p50"],
             }
     finally:
         dp.close()
@@ -412,7 +412,7 @@ def run_evaluation(
             "deadline_ms": cfg.deadline_ms,
             "bitrate_kbps": [cfg.video.min_bitrate_kbps, cfg.video.max_bitrate_kbps],
             "reward_weights": cfg.weights.to_dict(),
-            "transport_arch": cfg.transport_arch,
+            "path_arch": cfg.path_arch,
             "dynamics_enabled": cfg.dynamics is not None,
             "paths": cfg.paths,
             "has_learned": "learned" in policies,

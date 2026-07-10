@@ -1,14 +1,14 @@
 # Tuning the network dynamics — when does the hierarchy matter?
 
 How to move the simulated network (both backends) along the axis from
-"App agent alone is sufficient" to "the Transport (split) agent is essential",
+"App agent alone is sufficient" to "the Path (split) agent is essential",
 so the boundary can be mapped systematically.
 
 ## The quantity that decides it
 
 The single-agent `app_only` ablation uses the learned bitrate with an **even
 split over active paths** (the liveness mask is free — dead-path avoidance never
-differentiates the transport agent). What differentiates it is **per-path
+differentiates the path agent). What differentiates it is **per-path
 headroom**:
 
 ```
@@ -38,7 +38,7 @@ comfortably above `bitrate / n_active`.
 
 | knob | mock effect | NS-3 effect | direction |
 |---|---|---|---|
-| `rate` | `base_mbps` of the analytic path | bottleneck link `DataRate` | ↓ rate ⇒ less headroom ⇒ more transport-relevant |
+| `rate` | `base_mbps` of the analytic path | bottleneck link `DataRate` | ↓ rate ⇒ less headroom ⇒ more path-relevant |
 | `delay` | base RTT (×2) | link propagation delay | ↑ delay eats deadline budget; ≥ `deadline/2` makes a path a latency trap |
 | `cross_frac` | always-on analytic sinusoid, mean `0.5×cross_frac` of capacity | on/off UDP flood at `cross_frac × rate` while ON (duty ≈ 40–45%) | ↑ ⇒ deeper, path-specific dips |
 
@@ -74,7 +74,7 @@ The largest single lever, and the one that closed the mock/NS-3 ablation gap:
   (`ns3/realtime_mpquic.cc`), folded into `ApplyPathRate` — dynamics-gated so
   the static scenario stays byte-identical. Noise sigma set in `InitDynamics`.
 
-↑ `amp` ⇒ deeper multi-second troughs ⇒ more transport-relevant. Setting the
+↑ `amp` ⇒ deeper multi-second troughs ⇒ more path-relevant. Setting the
 envelope amplitude near 0 on both sides largely restores "App-only sufficient"
 on NS-3 even with churn/regime/burst on. **Keep the formulas identical in both
 files**, then rebuild: `scripts/install_ns3_example.sh`.
@@ -111,7 +111,7 @@ parameters.
 3. Train (~15 min per NS-3 run on this machine):
    `uv run python train.py --config configs/dynamic.yaml --backend ns3 --ns3-transport udp --episodes 100 --seed 1 --out-dir runs/<name>`
 4. Evaluate with ablations:
-   `uv run python evaluate.py --config configs/dynamic.yaml --backend ns3 --ns3-transport udp --app runs/<name>/app.pth --transport runs/<name>/transport.pth --ablation --figures --out runs/<name>/eval`
+   `uv run python evaluate.py --config configs/dynamic.yaml --backend ns3 --ns3-transport udp --app runs/<name>/app.pth --path runs/<name>/path.pth --ablation --figures --out runs/<name>/eval`
 5. Read `app_only / learned` QoE and the deadline-miss gap
    (`eval/figures/figure12_ablation.png`).
 
@@ -127,7 +127,7 @@ Starting from `configs/dynamic.yaml` (which separates on both backends as of
 | direction | change (one at a time) |
 |---|---|
 | → App-only sufficient | envelope `amp` → 0.2 / 0.0 (both code sites); or `rate` +50%; or `regime_lo` 0.55 → 0.8; or `cross_frac` −0.15 |
-| → Transport essential | `regime_lo` 0.55 → 0.40; or `burst_rate` 0.10 → 0.20 with `burst_duration_s` 0.5 → 1.0; or `cross_frac` +0.10; or `min_active` 3 → 2 |
+| → Path essential | `regime_lo` 0.55 → 0.40; or `burst_rate` 0.10 → 0.20 with `burst_duration_s` 0.5 → 1.0; or `cross_frac` +0.10; or `min_active` 3 → 2 |
 | sanity floor | if even-split loss at the *minimum* bitrate exceeds ~10% on NS-3, back off — the scenario is beyond the useful regime |
 
 Reference points measured so far (UDP, seed 1000, 5 eval episodes):

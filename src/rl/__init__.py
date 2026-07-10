@@ -1,1 +1,1 @@
-"""Reinforcement-learning layer: generic SAC and the App/Transport agent wrappers."""
+"""Reinforcement-learning layer: generic SAC and the App/Path agent wrappers."""

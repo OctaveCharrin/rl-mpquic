@@ -3,15 +3,15 @@ Dual-agent hierarchical training loop.
 
 Drives one long-lived data-plane backend (mock or NS-3) frame by frame:
 
-* **every frame** the Transport agent observes per-path transport state + the
+* **every frame** the Path agent observes per-path transport state + the
   current target bitrate, picks a split, the env delivers the frame, and the
-  agent is stored/updated on the per-frame transport reward;
+  agent is stored/updated on the per-frame path reward;
 * **every ``app_period_s``** the App agent picks a new target bitrate; the
   *previous* App action is credited with the VMAF-QoE accumulated over the window
   of frames it governed (a delayed, hierarchical reward).
 
 Episodes are delimited in-band (the backend keeps the network warm across them).
-Checkpoints (``app.pth`` / ``transport.pth``) and ``stats.json`` are written to
+Checkpoints (``app.pth`` / ``path.pth``) and ``stats.json`` are written to
 the run directory.
 """
 
@@ -28,29 +28,29 @@ import torch
 
 from ..ns3env.realtime_env import HierarchicalRealtimeEnv
 from ..rl.app_agent import AppAgent
-from ..rl.transport_agent import TransportAgent
+from ..rl.path_agent import PathAgent
 from .config import ExperimentConfig
 
 
-def _build_transport_agent(cfg: ExperimentConfig, env: HierarchicalRealtimeEnv) -> TransportAgent:
-    """Construct the Transport agent for the configured architecture."""
-    if cfg.transport_arch == "scoring":
-        return TransportAgent(
-            env.transport_obs_dim,
+def _build_path_agent(cfg: ExperimentConfig, env: HierarchicalRealtimeEnv) -> PathAgent:
+    """Construct the Path agent for the configured architecture."""
+    if cfg.path_arch == "scoring":
+        return PathAgent(
+            env.path_obs_dim,
             env.num_paths,
             config=cfg.sac,
             arch="scoring",
-            global_dim=env.transport_global_dim,
-            path_dim=env.transport_path_dim,
+            global_dim=env.path_global_dim,
+            path_dim=env.path_feat_dim,
         )
-    return TransportAgent(env.transport_obs_dim, env.num_paths, config=cfg.sac, arch="flat")
+    return PathAgent(env.path_obs_dim, env.num_paths, config=cfg.sac, arch="flat")
 
 
-def _transport_obs(env: HierarchicalRealtimeEnv, obs, target_kbps: float, arch: str):
-    """Build the transport observation matching the agent architecture."""
+def _path_obs(env: HierarchicalRealtimeEnv, obs, target_kbps: float, arch: str):
+    """Build the path-agent observation matching the agent architecture."""
     if arch == "scoring":
-        return env.build_transport_state(obs, target_kbps)
-    return env.build_transport_obs(obs, target_kbps)
+        return env.build_path_state(obs, target_kbps)
+    return env.build_path_obs(obs, target_kbps)
 
 
 def _app_sac_config(cfg: ExperimentConfig, frames_per_app: int):
@@ -98,7 +98,7 @@ def run_training(
         episode_seconds=cfg.episode_seconds,
         vmaf_fn=vmaf_fn,
     )
-    # First reset establishes num_paths (needed to size the transport agent).
+    # First reset establishes num_paths (needed to size the path agent).
     env.reset(seed=base_seed)
     frames_per_app = max(1, round(cfg.fps * cfg.app_period_s))
 
@@ -108,29 +108,29 @@ def run_training(
         max_kbps=cfg.video.max_bitrate_kbps,
         config=_app_sac_config(cfg, frames_per_app),
     )
-    transport = _build_transport_agent(cfg, env)
+    path_agent = _build_path_agent(cfg, env)
 
     app_ckpt = os.path.join(out_dir, "app.pth")
-    transport_ckpt = os.path.join(out_dir, "transport.pth")
+    path_ckpt = os.path.join(out_dir, "path.pth")
 
     def _save_ckpts() -> None:
         torch.save(app.sac.state_dict(), app_ckpt)
-        torch.save(transport.sac.state_dict(), transport_ckpt)
+        torch.save(path_agent.sac.state_dict(), path_ckpt)
 
     # Optional resume: reload the latest checkpoints and skip the uniform-random
     # warm-up (the replay buffer restarts empty, so updates resume once it refills)
     # — lets a long train be split across several shorter, interruptible runs.
-    if resume and os.path.exists(app_ckpt) and os.path.exists(transport_ckpt):
+    if resume and os.path.exists(app_ckpt) and os.path.exists(path_ckpt):
         app.sac.load_state_dict(torch.load(app_ckpt, map_location="cpu"))
-        transport.sac.load_state_dict(torch.load(transport_ckpt, map_location="cpu"))
+        path_agent.sac.load_state_dict(torch.load(path_ckpt, map_location="cpu"))
         app.sac._stores = max(app.sac._stores, app.sac.cfg.start_steps)
-        transport.sac._stores = max(transport.sac._stores, transport.sac.cfg.start_steps)
+        path_agent.sac._stores = max(path_agent.sac._stores, path_agent.sac.cfg.start_steps)
         print(f"resumed from checkpoints in {out_dir}", flush=True)
 
     history: List[Dict[str, float]] = []
     try:
         for ep in range(episodes):
-            stats = _run_episode(env, app, transport, seed=base_seed + ep, episode=ep)
+            stats = _run_episode(env, app, path_agent, seed=base_seed + ep, episode=ep)
             history.append(stats)
             # Checkpoint after every episode so an interrupted run still leaves a
             # usable (latest) model rather than nothing.
@@ -138,7 +138,7 @@ def run_training(
             if log_every and ep % log_every == 0:
                 print(
                     f"[ep {ep:3d}] QoE={stats['app_reward_mean']:+.3f} "
-                    f"T={stats['transport_reward_mean']:+.3f} "
+                    f"P={stats['path_reward_mean']:+.3f} "
                     f"bitrate={stats['bitrate_mean_kbps']:6.0f}kbps "
                     f"lat={stats['latency_mean_ms']:6.1f}ms "
                     f"loss={stats['loss_mean']:.3f}",
@@ -153,7 +153,7 @@ def run_training(
         "backend": backend,
         "episodes": episodes,
         "num_paths": env.num_paths,
-        "transport_arch": cfg.transport_arch,
+        "path_arch": cfg.path_arch,
         "config": _config_summary(cfg),
         "history": history,
     }
@@ -166,7 +166,7 @@ def run_training(
 def _run_episode(
     env: HierarchicalRealtimeEnv,
     app: AppAgent,
-    transport: TransportAgent,
+    path_agent: PathAgent,
     *,
     seed: int,
     episode: int,
@@ -178,7 +178,7 @@ def _run_episode(
     prev_app_raw: Optional[np.ndarray] = None
 
     ep_app_r, n_app = 0.0, 0
-    ep_t_r, n_frames = 0.0, 0
+    ep_p_r, n_frames = 0.0, 0
     latencies, losses, bitrates, vmafs = [], [], [], []
 
     done = env.is_done()
@@ -196,18 +196,18 @@ def _run_episode(
             target_kbps, prev_app_raw = app.select(cur_app_obs)
             prev_app_obs = cur_app_obs
 
-        # --- Transport decision (every frame) ---
-        t_obs = _transport_obs(env, obs, target_kbps, transport.arch)
-        split, t_raw = transport.select(t_obs)
-        next_obs, t_r, done, info = env.step(target_kbps, split)
-        t_next_obs = _transport_obs(env, next_obs, target_kbps, transport.arch)
+        # --- Path decision (every frame) ---
+        p_obs = _path_obs(env, obs, target_kbps, path_agent.arch)
+        split, p_raw = path_agent.select(p_obs)
+        next_obs, p_r, done, info = env.step(target_kbps, split)
+        p_next_obs = _path_obs(env, next_obs, target_kbps, path_agent.arch)
         # The episode horizon is a time-limit *truncation*, not a real terminal
         # (the call could continue), so always bootstrap off the next state
         # (done=False) to keep the policy horizon-agnostic.
-        transport.store(t_obs, t_raw, t_r, t_next_obs, False)
-        transport.update()
+        path_agent.store(p_obs, p_raw, p_r, p_next_obs, False)
+        path_agent.update()
 
-        ep_t_r += t_r
+        ep_p_r += p_r
         n_frames += 1
         latencies.append(info.latency_ms)
         losses.append(info.loss)
@@ -230,7 +230,7 @@ def _run_episode(
         "frames": n_frames,
         "app_decisions": n_app,
         "app_reward_mean": ep_app_r / max(1, n_app),
-        "transport_reward_mean": ep_t_r / max(1, n_frames),
+        "path_reward_mean": ep_p_r / max(1, n_frames),
         "bitrate_mean_kbps": float(np.mean(bitrates)) if bitrates else 0.0,
         "latency_mean_ms": float(np.mean(latencies)) if latencies else 0.0,
         "loss_mean": float(np.mean(losses)) if losses else 0.0,
@@ -247,7 +247,7 @@ def _config_summary(cfg: ExperimentConfig) -> Dict[str, object]:
         "bitrate_kbps": [cfg.video.min_bitrate_kbps, cfg.video.max_bitrate_kbps],
         "reward_weights": cfg.weights.to_dict(),
         "use_learned_vmaf": cfg.use_learned_vmaf,
-        "transport_arch": cfg.transport_arch,
+        "path_arch": cfg.path_arch,
         "dynamics": dataclasses.asdict(cfg.dynamics) if cfg.dynamics else None,
         "paths": cfg.paths,
     }

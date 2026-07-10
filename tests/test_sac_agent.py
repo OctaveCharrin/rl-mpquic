@@ -1,10 +1,10 @@
-"""Smoke tests for the SAC agent and the App/Transport wrappers."""
+"""Smoke tests for the SAC agent and the App/Path wrappers."""
 
 import numpy as np
 
 from src.rl.app_agent import AppAgent
 from src.rl.sac_agent import SACAgent, SACConfig
-from src.rl.transport_agent import TransportAgent
+from src.rl.path_agent import PathAgent
 
 
 def _tiny_cfg():
@@ -49,8 +49,8 @@ def test_app_agent_maps_to_bitrate_range():
         assert raw.shape == (1,)
 
 
-def test_transport_agent_split_is_simplex():
-    tr = TransportAgent(obs_dim=10, num_paths=3, config=_tiny_cfg())
+def test_path_agent_split_is_simplex():
+    tr = PathAgent(obs_dim=10, num_paths=3, config=_tiny_cfg())
     split, raw = tr.select(np.zeros(10, dtype=np.float32))
     assert split.shape == (3,)
     assert abs(float(split.sum()) - 1.0) < 1e-5

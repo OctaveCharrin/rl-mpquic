@@ -18,17 +18,17 @@ def test_obs_dimensions():
     env.reset(seed=2)
     n = env.num_paths
     assert env.app_obs_dim == 5
-    assert env.transport_obs_dim == 4 + 5 * n
-    assert env.transport_act_dim == n
+    assert env.path_obs_dim == 4 + 5 * n
+    assert env.path_act_dim == n
     assert env.build_app_obs().shape == (5,)
-    assert env.build_transport_obs().shape == (4 + 5 * n,)
+    assert env.build_path_obs().shape == (4 + 5 * n,)
 
 
-def test_transport_obs_encodes_target_bitrate():
+def test_path_obs_encodes_target_bitrate():
     env = _env()
     obs = env.reset(seed=2)
-    lo = env.build_transport_obs(obs, env.video.min_bitrate_kbps)[0]
-    hi = env.build_transport_obs(obs, env.video.max_bitrate_kbps)[0]
+    lo = env.build_path_obs(obs, env.video.min_bitrate_kbps)[0]
+    hi = env.build_path_obs(obs, env.video.max_bitrate_kbps)[0]
     assert hi > lo  # first feature is the normalized target bitrate (hierarchy)
 
 
@@ -84,7 +84,7 @@ def test_training_smoke_mock(tmp_path):
     assert len(out["history"]) == 2
     for ep in out["history"]:
         assert np.isfinite(ep["app_reward_mean"])
-        assert np.isfinite(ep["transport_reward_mean"])
+        assert np.isfinite(ep["path_reward_mean"])
     assert (tmp_path / "app.pth").exists()
-    assert (tmp_path / "transport.pth").exists()
+    assert (tmp_path / "path.pth").exists()
     assert (tmp_path / "stats.json").exists()

@@ -7,7 +7,7 @@ per-method decision timings). Pass ``--figures`` to also render the figure set
 via ``evaluation/generate_figures.py``.
 
 Examples:
-    python evaluate.py --backend mock --app runs/<ts>/app.pth --transport runs/<ts>/transport.pth --figures
+    python evaluate.py --backend mock --app runs/<ts>/app.pth --path runs/<ts>/path.pth --figures
     python evaluate.py --backend mock            # baselines only
 """
 
@@ -30,7 +30,7 @@ def main() -> None:
     p.add_argument("--episodes", type=int, default=5)
     p.add_argument("--seed", type=int, default=1000)
     p.add_argument("--app", default=None, help="App agent checkpoint (app.pth)")
-    p.add_argument("--transport", default=None, help="Transport agent checkpoint (transport.pth)")
+    p.add_argument("--path", default=None, help="Path agent checkpoint (path.pth)")
     p.add_argument("--out", default=None, help="output run dir (default runs/eval-<ts>)")
     p.add_argument(
         "--ns3-transport",
@@ -49,13 +49,13 @@ def main() -> None:
     p.add_argument(
         "--ablation",
         action="store_true",
-        help="add single-agent ablations (app_only / transport_only) to isolate "
-        "each agent's contribution; requires --app and --transport",
+        help="add single-agent ablations (app_only / path_only) to isolate "
+        "each agent's contribution; requires --app and --path",
     )
     args = p.parse_args()
 
-    if args.ablation and not (args.app and args.transport):
-        p.error("--ablation requires both --app and --transport checkpoints")
+    if args.ablation and not (args.app and args.path):
+        p.error("--ablation requires both --app and --path checkpoints")
 
     cfg = load_config(args.config)
     if args.ns3_transport:
@@ -67,7 +67,7 @@ def main() -> None:
         episodes=args.episodes,
         seed=args.seed,
         app_ckpt=args.app,
-        transport_ckpt=args.transport,
+        path_ckpt=args.path,
         show_output=args.show_output,
         out_dir=out_dir,
         save_json=True,

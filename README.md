@@ -9,7 +9,7 @@ Two agents cooperate at two timescales:
 | Agent | Cadence | Observes | Acts |
 |-------|---------|----------|------|
 | **App** | every 1 s | aggregate RTT / jitter / loss / throughput / bitrate | target encoder bitrate (kbps) |
-| **Transport** | every frame (~33 ms) | per-path cwnd / sRTT / send-backlog / goodput / loss **+ the App agent's target bitrate** | per-path traffic split (softmax) |
+| **Path** | every frame (~33 ms) | per-path cwnd / sRTT / send-backlog / goodput / loss **+ the App agent's target bitrate** | per-path traffic split (softmax) |
 
 The reward is a real-time video **QoE**: `a·VMAF(bitrate) − b·latency − c·jitter − d·loss`.
 
@@ -23,11 +23,11 @@ train.py / evaluate.py    thin CLIs
 src/train/                config loader + dual-agent loop + evaluation/baselines
         │
 src/ns3env/               HierarchicalRealtimeEnv  (obs builders + QoE reward window)
-        │   ├── qoe.py            VMAF curve + QoE / transport rewards
+        │   ├── qoe.py            VMAF curve + QoE / path rewards
         │   ├── video_source.py   frame-size model (mirrors the C++ generator)
         │   └── dataplane.py      DataPlane ABC | MockRealtimeDataPlane | Ns3DataPlane
         │
-src/rl/                   SACAgent (generic) + AppAgent / TransportAgent wrappers
+src/rl/                   SACAgent (generic) + AppAgent / PathAgent wrappers
         │
 ns3/                      C++ NS-3 scenario (vendored; symlinked into ns-3-dev)
 ```
@@ -56,7 +56,7 @@ uv sync --extra dev
 uv run pytest                                    # unit + smoke tests
 uv run python train.py --backend mock --episodes 50
 uv run python evaluate.py --backend mock \
-    --app runs/<ts>/app.pth --transport runs/<ts>/transport.pth
+    --app runs/<ts>/app.pth --path runs/<ts>/path.pth
 ```
 
 ## NS-3 workflow (Linux / WSL2)
@@ -80,7 +80,7 @@ Then train / evaluate against the real simulator:
 ```bash
 uv run python train.py --backend ns3 --episodes 5 --show-output
 uv run python evaluate.py --backend ns3 \
-    --app runs/<ts>/app.pth --transport runs/<ts>/transport.pth
+    --app runs/<ts>/app.pth --path runs/<ts>/path.pth
 ```
 
 ## Configuration

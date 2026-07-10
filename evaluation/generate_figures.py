@@ -70,7 +70,7 @@ FULL_WIDTH = 7.0
 DISPLAY = {
     "learned": "Hierarchical RL (Ours)",
     "app_only": "App Agent Only",
-    "transport_only": "Transport Agent Only",
+    "path_only": "Path Agent Only",
     "even": "Even Split",
     "single": "Single Best",
     "proportional": "Proportional",
@@ -78,13 +78,13 @@ DISPLAY = {
 COLORS = {
     "learned": "#1f77b4",
     "app_only": "#17becf",
-    "transport_only": "#9467bd",
+    "path_only": "#9467bd",
     "even": "#ff7f0e",
     "single": "#2ca02c",
     "proportional": "#d62728",
 }
 # Ablation variants (one learned agent disabled), in display order.
-ABLATION_ORDER = ("learned", "app_only", "transport_only")
+ABLATION_ORDER = ("learned", "app_only", "path_only")
 _FALLBACK_COLORS = ["#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
 
 
@@ -261,12 +261,12 @@ def fig_decision_time(summary, distributions, order, fig_dir):
     x = np.arange(len(order))
     w = 0.38
 
-    # (a) mean app vs transport decision time (log scale: RL >> heuristics).
+    # (a) mean app vs path decision time (log scale: RL >> heuristics).
     app = [summary[m]["app_decision_ms"]["mean"] for m in order]
-    tra = [summary[m]["transport_decision_ms"]["mean"] for m in order]
+    tra = [summary[m]["path_decision_ms"]["mean"] for m in order]
     eps = 1e-4
     a1.bar(x - w / 2, np.maximum(app, eps), w, label="App (bitrate)", color="#4C72B0")
-    a1.bar(x + w / 2, np.maximum(tra, eps), w, label="Transport (split)", color="#DD8452")
+    a1.bar(x + w / 2, np.maximum(tra, eps), w, label="Path (split)", color="#DD8452")
     a1.set_yscale("log")
     a1.set_ylabel("Decision time (ms, log)")
     a1.set_title("(a) Mean Inference Time per Decision")
@@ -277,8 +277,8 @@ def fig_decision_time(summary, distributions, order, fig_dir):
     for i, v in enumerate(tra):
         a1.text(i + w / 2, max(v, eps), f"{v:.3g}", ha="center", va="bottom", fontsize=7)
 
-    # (b) per-frame transport decision time distribution.
-    data = [np.maximum(np.asarray(distributions[m]["transport_decision_ms"], float), eps)
+    # (b) per-frame path decision time distribution.
+    data = [np.maximum(np.asarray(distributions[m]["path_decision_ms"], float), eps)
             for m in order]
     data = [d if d.size else np.array([eps]) for d in data]
     bp = a2.boxplot(data, widths=0.6, patch_artist=True, showfliers=False)
@@ -286,7 +286,7 @@ def fig_decision_time(summary, distributions, order, fig_dir):
         patch.set_facecolor(col(m))
         patch.set_alpha(0.7)
     a2.set_yscale("log")
-    a2.set_ylabel("Transport decision time (ms, log)")
+    a2.set_ylabel("Path decision time (ms, log)")
     a2.set_title("(b) Per-Frame Split-Decision Time")
     a2.set_xticks(range(1, len(order) + 1))
     a2.set_xticklabels([disp(m) for m in order], rotation=35, ha="right")
@@ -297,7 +297,7 @@ def fig_decision_time(summary, distributions, order, fig_dir):
 def fig_quality_vs_cost(summary, order, fig_dir):
     fig, ax = plt.subplots(figsize=(COLUMN_WIDTH, 3))
     for m in order:
-        x = max(summary[m]["transport_decision_ms"]["p50"], 1e-4)
+        x = max(summary[m]["path_decision_ms"]["p50"], 1e-4)
         y = summary[m]["qoe"]["mean"]
         ax.scatter(x, y, s=90 if _is_ours(m) else 60, color=col(m),
                    edgecolor="black", linewidth=1.4 if _is_ours(m) else 0.6,
@@ -384,7 +384,7 @@ def _path_label(meta, i):
 
 def fig_path_metrics(traces, meta, order, fig_dir):
     """Per-path network state + the policy's allocation over time, so one can see
-    how the paths evolve and how the Transport agent reacts. Uses the learned
+    how the paths evolve and how the Path agent reacts. Uses the learned
     policy's representative episode (else the first method with per-path traces)."""
     pick = "learned" if "learned" in traces else (order[0] if order else None)
     if pick is None:
@@ -522,7 +522,7 @@ def fig_ablation(summary, fig_dir):
     """Single-agent ablation: the contribution of each learned agent.
 
     Compares the full hierarchical controller to variants with one agent
-    disabled (``app_only`` = Transport off, ``transport_only`` = App off), with
+    disabled (``app_only`` = Path off, ``path_only`` = App off), with
     the best heuristic baseline (hatched) for reference. Skipped unless at least
     one ablation variant is present in the results."""
     methods = [m for m in ABLATION_ORDER if m in summary]
@@ -603,7 +603,7 @@ def fig_radar(summary, order, fig_dir):
     lat = _norm_lower_better([summary[m]["latency_ms"]["mean"] for m in order])
     loss = _norm_lower_better([summary[m]["loss"]["mean"] for m in order])
     dec = _norm_lower_better(
-        [np.log10(max(summary[m]["transport_decision_ms"]["p50"], 1e-4)) for m in order]
+        [np.log10(max(summary[m]["path_decision_ms"]["p50"], 1e-4)) for m in order]
     )
     metrics = np.vstack([qoe, vmaf, lat, loss, dec]).T  # (methods, axes)
 
@@ -641,7 +641,7 @@ def write_summary_csv(summary, order, path):
         ("bitrate_mean_kbps", lambda s: s["bitrate_kbps"]["mean"]),
         ("throughput_mean_mbps", lambda s: s["throughput_mbps"]["mean"]),
         ("app_decision_ms_p50", lambda s: s["app_decision_ms"]["p50"]),
-        ("transport_decision_ms_p50", lambda s: s["transport_decision_ms"]["p50"]),
+        ("path_decision_ms_p50", lambda s: s["path_decision_ms"]["p50"]),
     ]
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
@@ -663,7 +663,7 @@ def print_table(summary, order):
         print(
             f"{disp(m):<24}{s['qoe']['mean']:>9.3f}{s['vmaf']['mean']:>8.1f}"
             f"{s['latency_ms']['p50']:>9.1f}{100 * s['deadline_miss_rate']:>8.1f}"
-            f"{s['transport_decision_ms']['p50']:>12.4f}"
+            f"{s['path_decision_ms']['p50']:>12.4f}"
         )
 
 

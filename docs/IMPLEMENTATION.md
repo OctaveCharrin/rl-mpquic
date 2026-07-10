@@ -25,7 +25,7 @@ Everything is clocked by **one video frame** (`1/fps`, default 33.3 ms at 30 fps
 Per frame there is exactly **one** observation→action exchange between brain and
 body:
 
-- The **Transport agent** acts **every frame** — it chooses the per-path byte
+- The **Path agent** acts **every frame** — it chooses the per-path byte
   split `splitRatio[]`.
 - The **App agent** acts only on an **app boundary** (every `app_period_s`, default
   1 s = every 30 frames), signalled by `EnvStruct.appDecisionDue`. Its chosen
@@ -308,21 +308,21 @@ Pure numpy, no torch. Features are normalized to roughly `[0, 1]` and clipped.
 | 4 | aggregate throughput | `throughput_mbps / cap_mbps` |
 
 The App agent sees only **aggregate, sender-observable** state. It deliberately
-does **not** see per-path detail (that's Transport's job) and **not** episode
+does **not** see per-path detail (that's the Path agent's job) and **not** episode
 progress/time-to-go — a deployable policy must be horizon-agnostic (a real call has
 unknown duration). The fixed training horizon is handled as a *truncation* (§3.4).
 
-**Flat Transport observation** — `build_transport_obs`, **dim `4 + 5N`** (24 for
+**Flat Path observation** — `build_path_obs`, **dim `4 + 5N`** (24 for
 N=4, 34 for N=6):
 - Global block (4): `[bitrate_norm, rtt/latency_norm, loss, throughput/cap]`. The
   first element is the **App agent's current target bitrate** — this is the
-  hierarchical coupling (Transport is conditioned on the load it must schedule).
+  hierarchical coupling (the Path agent is conditioned on the load it must schedule).
 - Per-path block (5 × N): for each path `[cwnd/200000, srtt/latency_norm,
   bufferOcc/200000, path_throughput/cap, path_loss]`.
 
-**Structured Transport state** — `build_transport_state`, for the scoring agent.
+**Structured Path state** — `build_path_state`, for the scoring agent.
 The flat vector hard-codes path count/order and cannot represent a *changing* set.
-The same features are instead a `TransportState(glob, paths, mask)` triple:
+The same features are instead a `PathState(glob, paths, mask)` triple:
 - `glob`: `(4,)` — the same global block.
 - `paths`: `(N, 6)` — the five flat per-path features **plus the liveness flag**.
 - `mask`: `(N,)` — `1.0` live / `0.0` churned out.
@@ -376,7 +376,7 @@ kbps = min_kbps + (a+1)/2 · (max_kbps − min_kbps)      # defaults 300–6000
 `select(obs) → (kbps, raw_action)`; the **raw `[−1,1]` action is what is stored**
 in the buffer / scored by the critic.
 
-### 2.4 Transport agent wrapper (`src/rl/transport_agent.py`)
+### 2.4 Path agent wrapper (`src/rl/path_agent.py`)
 
 Dispatches on `arch`:
 
@@ -424,10 +424,10 @@ clamped) so comparisons isolate *scheduling* quality:
 | `single` | whole frame on the highest recent-throughput active path (argmax) |
 | `proportional` | ∝ recent per-path throughput (active only) |
 | `random` | fresh Dirichlet-uniform split over active paths each frame (seeded) |
-| `learned` | trained App + Transport agents, acting **deterministically** |
+| `learned` | trained App + Path agents, acting **deterministically** |
 
 The learned policy is reconstructed by `_learned_policies`, which reads the
-Transport checkpoint's `arch` tag to rebuild the flat or scoring agent and feed it
+Path checkpoint's `arch` tag to rebuild the flat or scoring agent and feed it
 the matching (flat vs. structured) observation.
 
 ---
@@ -465,11 +465,11 @@ adjustments:
   `(1−loss)` so it only pays for on-time bits. `e_util` defaults to `0.0` (off) and
   is **only applied with a learned scorer**.
 
-**Transport reward** (`compute_transport_reward`), per frame, clipped `[−2, 1]`:
+**Path reward** (`compute_path_reward`), per frame, clipped `[−2, 1]`:
 ```
-R_t = (1 − loss) − b·clip(latency/latency_norm,0,2) − c·clip(jitter/jitter_norm,0,2)
+R_p = (1 − loss) − b·clip(latency/latency_norm,0,2) − c·clip(jitter/jitter_norm,0,2)
 ```
-The quality term is **intentionally excluded** — the Transport agent doesn't set
+The quality term is **intentionally excluded** — the Path agent doesn't set
 bitrate, so rewarding it for quality would be miscredited. It is rewarded purely
 for delivering the given frame quickly and intact. This clean decomposition is what
 gives each agent a well-attributed gradient.
@@ -483,12 +483,12 @@ which aggregates the window (mean latency/jitter/loss), scores it with the App Q
 functional, **clears the window**, and returns the scalar reward + unweighted
 components. That reward is credited to the **previous** App action — the bitrate
 that actually governed those frames (a correct temporally-extended reward for the
-slow agent). The Transport agent is rewarded immediately each frame.
+slow agent). The Path agent is rewarded immediately each frame.
 
 ### 3.3 The dual-cadence loop (`src/train/hierarchical_train.py`)
 
-`run_training` builds the data plane, env, and both agents (sizing Transport from
-`env.num_paths` after the first `reset`), then runs episodes. Per episode
+`run_training` builds the data plane, env, and both agents (sizing the Path agent
+from `env.num_paths` after the first `reset`), then runs episodes. Per episode
 (`_run_episode`):
 
 ```
@@ -505,12 +505,12 @@ while not done:
         target_kbps, prev_app_raw ← app.select(app_obs)
         prev_app_obs ← app_obs
 
-    t_obs  ← transport_obs(obs, target_kbps, arch)  # ── fast (Transport) cadence ──
-    split, t_raw ← transport.select(t_obs)
-    next_obs, r_t, done, info ← env.step(target_kbps, split)
-    t_next ← transport_obs(next_obs, target_kbps, arch)
-    transport.store(t_obs, t_raw, r_t, t_next, done=False)
-    transport.update()
+    p_obs  ← path_obs(obs, target_kbps, arch)       # ── fast (Path) cadence ──
+    split, p_raw ← path_agent.select(p_obs)
+    next_obs, r_p, done, info ← env.step(target_kbps, split)
+    p_next ← path_obs(next_obs, target_kbps, arch)
+    path_agent.store(p_obs, p_raw, r_p, p_next, done=False)
+    path_agent.update()
     obs ← next_obs
 # episode end: credit the final (partial) App window, also done=False
 ```
@@ -518,7 +518,7 @@ while not done:
 Correctness points:
 - The App transition's *next state* is the app-obs at the **next** boundary — a
   genuine temporally-extended tuple over the window.
-- `transport_obs(...)` builds the flat vector (flat arch) or the `TransportState`
+- `path_obs(...)` builds the flat vector (flat arch) or the `PathState`
   triple (scoring arch) to match the agent.
 - The App agent's warm-up thresholds are scaled down by `frames_per_app`
   (`_app_sac_config`: `start_steps`/`update_after` ÷ 30, floored at 50) since it
@@ -535,11 +535,11 @@ episode progress).
 
 ### 3.5 Checkpointing, logging, lifecycle
 
-- Checkpoints (`app.pth`, `transport.pth`) are written **after every episode**, so
+- Checkpoints (`app.pth`, `path.pth`) are written **after every episode**, so
   an interrupted run leaves a usable latest model. `--resume` reloads the latest and
   skips the uniform-random warm-up (the buffer restarts empty; updates resume once
   it refills) — enabling long trains split across interruptible chunks.
-- Per-episode logging: mean QoE, mean transport reward, mean bitrate/latency/loss/
+- Per-episode logging: mean QoE, mean path reward, mean bitrate/latency/loss/
   VMAF; a `stats.json` history is written to the run dir.
 - A `finally` block guarantees `dp.close()` (→ `ACT_TERMINATE`, shared-memory
   release) even on exceptions.
@@ -567,8 +567,8 @@ Per policy, across all episodes (`_rollout`):
 - **Decision (inference) time** of each agent call, measured *around the policy
   callable only* — so the learned policy captures observation-build + forward pass,
   and the baselines capture their cheap heuristic compute. Reported as
-  `app_decision_ms` and `transport_decision_ms` (the printed table shows the
-  Transport p50).
+  `app_decision_ms` and `path_decision_ms` (the printed table shows the
+  Path p50).
 - **Dynamics diagnostics per frame**: `active_paths` (live path count) and
   `split_entropy` (nats; `0` = one path, `ln k` = even over `k` paths).
 - **`deadline_miss_rate`**: fraction of frames with `loss ≥ 0.999`.
@@ -580,7 +580,7 @@ first-call latency.
 ### 4.2 The baseline comparison (always run)
 
 `even`, `single`, `proportional`, `random` (§2.6), plus `learned` **iff** both
-`--app` and `--transport` checkpoints are supplied (otherwise baselines-only). This
+`--app` and `--path` checkpoints are supplied (otherwise baselines-only). This
 isolates **scheduling quality** because all share the same reactive bitrate rule.
 Expected reading: on a no-dominant-path topology `single` is quality-capped (no one
 path saturates VMAF), `proportional` eats the latency-trap path's delay, and
@@ -593,22 +593,22 @@ its heuristic counterpart, to isolate each agent's marginal contribution:
 
 | Variant | Bitrate source | Split source | Isolates | Compare against |
 |---|---|---|---|---|
-| `transport_only` | reactive heuristic (App **off**) | learned split | value of the **learned scheduler** | `even` / `proportional` |
-| `app_only` | learned bitrate | `even` split (Transport **off**) | value of the **learned bitrate** | `even` (same split, heuristic vs learned bitrate) |
+| `path_only` | reactive heuristic (App **off**) | learned split | value of the **learned scheduler** | `even` / `proportional` |
+| `app_only` | learned bitrate | `even` split (Path **off**) | value of the **learned bitrate** | `even` (same split, heuristic vs learned bitrate) |
 | `learned` | learned | learned | full system | all of the above |
 
 **The headline result the ablation is designed to expose.** On the *static*
 four-path topology, `app_only` reaches ~98% of the full system's QoE — the optimal
 split barely moves, so the scheduler wins little. On the **non-stationary**
-`configs/dynamic.yaml` scenario (with the scoring Transport agent), `app_only`
+`configs/dynamic.yaml` scenario (with the scoring Path agent), `app_only`
 **collapses** (an even split shoves the encoder's bitrate onto congested/dead
 paths), while the full learned pair stays far ahead. This contrast is the argument
-for (a) making the network non-stationary and (b) giving the Transport agent a model
+for (a) making the network non-stationary and (b) giving the Path agent a model
 that ingests the changing path set.
 
 ### 4.4 The two headline scenarios
 
-| Scenario | Config | Paths | Dynamics | Transport arch | Purpose |
+| Scenario | Config | Paths | Dynamics | Path arch | Purpose |
 |---|---|---|---|---|---|
 | Static no-dominant | `configs/four_path.yaml` | 4 | off | `flat` | Show aggregation beats single-best / proportional; scheduler earns a modest QoE gain. Ablation → `app_only` ≈ full system. |
 | Non-stationary | `configs/dynamic.yaml` | 6 (min 3 active) | churn + regime + burst + corr `[[4,5]]` | `scoring` | Make the split decision matter; ablation → `app_only` collapses. |
@@ -626,7 +626,7 @@ uv run python train.py --config configs/four_path.yaml --backend mock --episodes
 uv run python train.py --config configs/dynamic.yaml   --backend mock --episodes 200
 # evaluate with ablation:
 uv run python evaluate.py --config configs/dynamic.yaml --backend mock \
-    --app runs/<run>/app.pth --transport runs/<run>/transport.pth --ablation
+    --app runs/<run>/app.pth --path runs/<run>/path.pth --ablation
 # NS-3 backend + UDP subflows:
 uv run python train.py --config configs/dynamic.yaml --backend ns3 --ns3-transport udp
 ```
@@ -646,9 +646,9 @@ uv run python train.py --config configs/dynamic.yaml --backend ns3 --ns3-transpo
 |---|---|
 | App observation dim | 5 (horizon-agnostic) |
 | App action dim | 1 → bitrate ∈ [300, 6000] kbps |
-| Flat Transport obs dim | `4 + 5N` (24 @ N=4, 34 @ N=6) |
-| Scoring Transport state | glob `(4,)`, paths `(N, 6)`, mask `(N,)` |
-| Transport action dim | N → softmax split (masked over active paths in scoring) |
+| Flat Path obs dim | `4 + 5N` (24 @ N=4, 34 @ N=6) |
+| Scoring Path state | glob `(4,)`, paths `(N, 6)`, mask `(N,)` |
+| Path action dim | N → softmax split (masked over active paths in scoring) |
 | Bridge exchanges/sec | `fps` = 30 |
 | App decisions/sec | 1 (every 30 frames) |
 
@@ -666,7 +666,7 @@ uv run python train.py --config configs/dynamic.yaml --backend ns3 --ns3-transpo
 | SAC hidden / γ / τ / lr | 256 / 0.99 / 0.005 / 3e-4 | `SACConfig` |
 | batch / buffer / start_steps / update_after | 256 / 200k / 1000 / 1000 | `SACConfig` |
 | cwnd / buffer obs normalizers | 200 000 B | `realtime_env.py` |
-| `transport_arch` | `flat` (default) / `scoring` | `run:` |
+| `path_arch` | `flat` (default) / `scoring` | `run:` |
 | `transport` (NS-3 protocol) | `tcp` / `udp` | `run:`, `--ns3-transport` |
 | `dynamics` | off by default (both backends) | `DynamicsConfig` |
 | kMaxPaths | 8 | `realtime_mpquic.h` |
@@ -684,14 +684,14 @@ uv run python train.py --config configs/dynamic.yaml --backend ns3 --ns3-transpo
 | `scripts/wedge_repro.py` | minimal repro for churn/rescale failure modes |
 | `src/ns3env/dataplane.py` | `DataPlane` ABC, `MockRealtimeDataPlane`, `Ns3DataPlane`, `FrameObs`/`FrameResult`, `DynamicsConfig` |
 | `src/ns3env/video_source.py` | frame-size model (mirrors C++) |
-| `src/ns3env/qoe.py` | VMAF curve, App QoE reward (pluggable `vmaf_fn`, optional util term), transport reward |
+| `src/ns3env/qoe.py` | VMAF curve, App QoE reward (pluggable `vmaf_fn`, optional util term), path reward |
 | `src/ns3env/qos_vmaf_reward.py` + `reward_model.npz` | vendored learned QoS→VMAF surrogate |
 | `src/ns3env/learned_vmaf.py` | adapter: learned surrogate → `vmaf_fn` |
-| `src/ns3env/realtime_env.py` | observation builders, reward window, `TransportState` |
+| `src/ns3env/realtime_env.py` | observation builders, reward window, `PathState` |
 | `src/rl/sac_agent.py` | generic flat SAC (actor, twin critics, targets, entropy tuning) |
 | `src/rl/scoring_sac_agent.py` | permutation-equivariant SAC (per-path actor + DeepSets critic) |
 | `src/rl/replay_buffer.py` | `ReplayBuffer` + `StructuredReplayBuffer` |
-| `src/rl/app_agent.py`, `src/rl/transport_agent.py` | action-space wrappers (Transport dispatches flat vs scoring) |
+| `src/rl/app_agent.py`, `src/rl/path_agent.py` | action-space wrappers (Path agent dispatches flat vs scoring) |
 | `src/train/config.py` | YAML → typed config; backend factories |
 | `src/train/hierarchical_train.py` | dual-cadence training loop |
 | `src/train/evaluate.py` | rollout + baselines + ablation |

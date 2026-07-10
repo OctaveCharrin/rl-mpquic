@@ -57,7 +57,7 @@ class ReplayBuffer:
 
 
 class StructuredReplayBuffer:
-    """Ring buffer of set-shaped transitions for the scoring transport agent.
+    """Ring buffer of set-shaped transitions for the scoring path agent.
 
     Each transition is a ``(global, paths, mask)`` state, a per-path action
     latent, a reward, the next state, and a done flag. The path count is fixed at

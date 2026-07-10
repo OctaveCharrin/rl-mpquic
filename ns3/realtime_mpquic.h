@@ -11,7 +11,7 @@
  * bridge therefore exchanges one Env/Act pair per frame (~33 ms of sim time at
  * 30 fps). Two RL agents run at two timescales over this single bridge:
  *
- *   - Transport agent: acts every frame; sets splitRatio[] (how to split the
+ *   - Path agent: acts every frame; sets splitRatio[] (how to split the
  *     next frame's bytes across the subflows).
  *   - App agent: acts only on a 1 s cadence (gated by EnvStruct.appDecisionDue);
  *     sets targetBitrateKbps, which PERSISTS in ActStruct between app decisions.

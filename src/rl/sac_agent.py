@@ -3,8 +3,8 @@ Generic continuous Soft Actor-Critic (SAC).
 
 A self-contained SAC operating in a **normalized action space** ``[-1, 1]^d``:
 the actor is a tanh-squashed diagonal Gaussian, with twin Q critics + Polyak
-targets and automatic entropy-temperature tuning. The App and Transport agents
-(:mod:`src.rl.app_agent`, :mod:`src.rl.transport_agent`) wrap this and map the
+targets and automatic entropy-temperature tuning. The App and Path agents
+(:mod:`src.rl.app_agent`, :mod:`src.rl.path_agent`) wrap this and map the
 normalized action into their own range (a target bitrate, or a softmax split).
 
 Off-policy + sample-efficient: each environment frame contributes one transition

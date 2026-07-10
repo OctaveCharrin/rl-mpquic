@@ -24,13 +24,13 @@ side is the "brain"; the C++ NS-3 scenario is a thin "body".
   an optional `DynamicsConfig` (churn/regime/burst/correlated failures) and a
   per-path `FrameObs.path_active` liveness mask (see below).
 - `src/ns3env/realtime_env.py` — observation builders + reward window. No torch.
-  Builds both the flat transport vector (`build_transport_obs`) and the structured
-  `TransportState` (`build_transport_state`, `glob`/`paths`/`mask`) for scoring.
+  Builds both the flat path-agent vector (`build_path_obs`) and the structured
+  `PathState` (`build_path_state`, `glob`/`paths`/`mask`) for scoring.
 - `src/ns3env/qoe.py`, `video_source.py` — reward math and the frame-size model
   (the latter mirrors `RealtimeController::GenerateFrame` in C++).
 - `src/rl/` — generic flat `SACAgent` and permutation-equivariant
   `ScoringSACAgent` (both in normalized `[-1,1]` action space), plus the
-  `AppAgent` / `TransportAgent` wrappers that map to bitrate / split. The Transport
+  `AppAgent` / `PathAgent` wrappers that map to bitrate / split. The Path
   wrapper dispatches on `arch` (`"flat"` | `"scoring"`).
 - `src/train/` — config loader, the dual-cadence training loop, evaluation+baselines.
 - `train.py` / `evaluate.py` — thin CLIs only.
@@ -38,9 +38,9 @@ side is the "brain"; the C++ NS-3 scenario is a thin "body".
 ## Two-timescale contract (important)
 
 The bridge is **synchronous lockstep, one exchange per frame**, C++ leads with a
-send. The Transport agent acts every frame. The App agent acts only when
+send. The Path agent acts every frame. The App agent acts only when
 `FrameObs.app_decision_due` is set (every `app_period_s`); its target bitrate
-persists in `ActStruct` between app decisions, and the Transport agent's
+persists in `ActStruct` between app decisions, and the Path agent's
 observation includes that bitrate (the hierarchy). The App reward is the QoE
 accumulated over the *window* of frames its bitrate governed
 (`env.pop_app_window_reward()`), credited to the previous app action.
@@ -57,7 +57,7 @@ the full system; on the dynamic scenario the same App-only ablation *collapses*)
   (abrupt best-path swaps), **congestion bursts**, **correlated failures**.
   `FrameObs.path_active` is the liveness mask. Deterministic per seed; static
   behavior is byte-identical when disabled.
-- **Scoring Transport agent** (`transport_arch: scoring`): consumes the structured
+- **Scoring Path agent** (`path_arch: scoring`): consumes the structured
   `(glob, paths, mask)` state, shared per-path actor + masked-softmax split,
   DeepSets masked-mean critic — handles a variable/changing path set. `"flat"`
   (legacy fixed-dim MLP) is the default. Checkpoints are arch-tagged; eval/`resume`
@@ -97,10 +97,10 @@ NS-3's real transport rather than the mock's analytical queue.
 uv sync --extra dev
 uv run pytest                                  # fast, mock-only, no NS-3
 uv run python train.py --backend mock --episodes 50
-# dynamic scenario + scoring (dynamic-input) transport agent:
+# dynamic scenario + scoring (dynamic-input) path agent:
 uv run python train.py --config configs/dynamic.yaml --backend mock --episodes 50
 uv run python evaluate.py --config configs/dynamic.yaml --backend mock \
-    --app runs/<run>/app.pth --transport runs/<run>/transport.pth --ablation
+    --app runs/<run>/app.pth --path runs/<run>/path.pth --ablation
 ```
 
 Training checkpoints every episode; `train.py --resume` continues from the latest

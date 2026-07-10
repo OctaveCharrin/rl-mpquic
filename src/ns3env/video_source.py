@@ -14,7 +14,7 @@ NS-3 backends produce comparable frame sizes:
 Real-time means frames are emitted on the wall clock (every ``1/fps`` seconds)
 regardless of whether the previous frame finished delivering — so when the send
 rate exceeds path capacity, frames queue and latency grows (the bufferbloat the
-Transport agent must avoid).
+Path agent must avoid).
 """
 
 from __future__ import annotations

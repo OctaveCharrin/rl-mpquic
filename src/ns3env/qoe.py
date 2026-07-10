@@ -18,10 +18,10 @@ a *learned* QoS->VMAF model that already folds loss into the quality score, the
 explicit ``- d*loss`` term is dropped to avoid double-counting, leaving
 ``a*VMAF(bitrate, loss, …) - b*latency - c*jitter`` (see ``compute_qoe_reward``).
 
-The Transport agent, which only moves bytes across paths (it does not set the
+The Path agent, which only moves bytes across paths (it does not set the
 bitrate), is rewarded for *delivering* frames cheaply:
 
-    R_transport = (1 - loss) - b*latency - c*jitter                    (Transport)
+    R_path = (1 - loss) - b*latency - c*jitter                         (Path)
 
 Reference: Zhi Li et al., "VMAF: The Journey Continues," Netflix Tech Blog, 2018.
 """
@@ -38,7 +38,7 @@ __all__ = [
     "VmafFn",
     "QoEWeights",
     "compute_qoe_reward",
-    "compute_transport_reward",
+    "compute_path_reward",
     "qoe_components",
 ]
 
@@ -205,14 +205,14 @@ def compute_qoe_reward(
     return float(max(-2.0, min(1.0, r)))
 
 
-def compute_transport_reward(
+def compute_path_reward(
     *,
     latency_ms: float,
     jitter_ms: float,
     loss: float,
     weights: Optional[QoEWeights] = None,
 ) -> float:
-    """Transport-agent reward: deliver frames on time and cheaply.
+    """Path-agent reward: deliver frames on time and cheaply.
 
     ``(1 - loss) - b*latency - c*jitter`` — high when the chosen split lands the
     frame quickly and intact, negative when it is late or lost. The bitrate
