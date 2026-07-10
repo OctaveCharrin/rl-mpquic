@@ -70,9 +70,6 @@ FULL_WIDTH = 7.0
 DISPLAY = {
     "learned": "Hierarchical RL (Ours)",
     "app_only": "App Agent Only",
-    "path_only": "Path Agent Only",
-    "path_only_cap": "Path Agent Only (cap. bitrate)",
-    "proportional_cap": "Proportional (cap. bitrate)",
     "path_only_gcc": "Path Agent Only (GCC bitrate)",
     "even": "Even Split",
     "single": "Single Best",
@@ -82,30 +79,21 @@ DISPLAY = {
 COLORS = {
     "learned": "#1f77b4",
     "app_only": "#17becf",
-    "path_only": "#9467bd",
-    "path_only_cap": "#7b3fbf",
-    "proportional_cap": "#e377c2",
     "path_only_gcc": "#5b2c9f",
     "even": "#ff7f0e",
     "single": "#2ca02c",
     "proportional": "#d62728",
     "webrtc": "#8c564b",
 }
-# Ablation variants (one learned agent disabled), in display order. The ``_cap``
-# / ``_gcc`` variants run the learned split under a non-collapsing bitrate driver
-# (BDP capacity / WebRTC GCC). ``proportional_cap`` is the cap driver's matched
-# reference; the GCC driver's matched reference is the standalone ``webrtc``
-# baseline (picked as the ablation panel's hatched reference).
-ABLATION_ORDER = (
-    "learned", "app_only", "path_only",
-    "path_only_cap", "proportional_cap",
-    "path_only_gcc",
-)
+# Ablation variants (one learned agent disabled), in display order. ``path_only_gcc``
+# runs the learned split under a WebRTC GCC bitrate driver (which, unlike the
+# reactive goodput heuristic, does not spiral to the bitrate floor); its matched
+# reference is the standalone ``webrtc`` baseline (picked as the ablation panel's
+# hatched reference).
+ABLATION_ORDER = ("learned", "app_only", "path_only_gcc")
 # Which ablation entries actually involve a learned agent (drawn solid; the pure
 # heuristic references in the ablation panel are hatched).
-_LEARNED_ABLATIONS = frozenset(
-    {"learned", "app_only", "path_only", "path_only_cap", "path_only_gcc"}
-)
+_LEARNED_ABLATIONS = frozenset({"learned", "app_only", "path_only_gcc"})
 _FALLBACK_COLORS = ["#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
 
 
@@ -543,7 +531,7 @@ def fig_ablation(summary, fig_dir):
     """Single-agent ablation: the contribution of each learned agent.
 
     Compares the full hierarchical controller to variants with one agent
-    disabled (``app_only`` = Path off, ``path_only`` = App off), with
+    disabled (``app_only`` = Path off, ``path_only_gcc`` = App off), with
     the best heuristic baseline (hatched) for reference. Skipped unless at least
     one ablation variant is present in the results."""
     methods = [m for m in ABLATION_ORDER if m in summary]

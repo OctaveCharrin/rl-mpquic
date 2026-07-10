@@ -64,37 +64,6 @@ def _heuristic_bitrate(cfg: ExperimentConfig) -> BitrateFn:
     return fn
 
 
-def _capacity_bitrate(cfg: ExperimentConfig) -> BitrateFn:
-    """Capacity-based bitrate that does **not** self-collapse.
-
-    The reactive :func:`_heuristic_bitrate` keys off *achieved goodput*
-    (``throughput_mbps``), so a split that under-utilizes the network delivers
-    few bytes -> low goodput -> low bitrate -> even fewer bytes offered: a
-    self-reinforcing spiral down to ``min_bitrate_kbps`` (the VMAF floor). That
-    traps any spread/even-like split at the floor regardless of scheduling
-    skill, which is exactly what confounds the ``path_only`` ablation.
-
-    This heuristic instead estimates *available* capacity from transport state:
-    per live path the bandwidth-delay-product delivery rate ``cwnd / sRTT``
-    (bits / s), summed across live paths. The congestion window reflects the
-    path's pipe, not how much the app happened to offer, so the estimate holds
-    up when the current split leaves capacity idle -> no death spiral. Bitrate
-    is set to 90% of the aggregate estimate, matching the goodput heuristic's
-    headroom factor.
-    """
-
-    def fn(obs: FrameObs) -> float:
-        m = _active_mask(obs)
-        cwnd_bytes = np.asarray(obs.cwnd, dtype=np.float64) * m
-        srtt_s = np.clip(np.asarray(obs.srtt_ms, dtype=np.float64), 1e-3, None) / 1000.0
-        rate_mbps = (cwnd_bytes * 8.0) / srtt_s / 1e6  # per-path BDP delivery rate
-        cap_mbps = float(rate_mbps.sum())
-        target = 0.9 * cap_mbps * 1000.0  # 90% of estimated capacity (kbps)
-        return cfg.video.clamp_bitrate(max(cfg.video.min_bitrate_kbps, target))
-
-    return fn
-
-
 # GCC / WebRTC constants (canonical libwebrtc values, applied per decision tick
 # since the App cadence ~ app_period_s ~ 1 s matches GCC's update period).
 _GCC_INCREASE = 1.08        # multiplicative increase when the link looks clear
@@ -400,28 +369,20 @@ def run_evaluation(
     ``use_learned_vmaf`` (when not None) overrides ``cfg.use_learned_vmaf`` so
     QoE is scored with the learned QoS->VMAF surrogate, matching how you trained.
 
-    ``ablation`` (requires both checkpoints) adds two single-agent variants that
+    ``ablation`` (requires both checkpoints) adds single-agent variants that
     disable one learned agent by swapping in its heuristic counterpart, to
     isolate each agent's contribution:
 
-    * ``path_only`` -- App agent disabled: reactive heuristic bitrate +
-      learned per-path split. Compare to ``even`` / ``proportional``.
-    * ``app_only``  -- Path agent disabled: learned bitrate + even
-      split. Compare to ``even`` (same split, heuristic vs learned bitrate).
-
-    The reactive goodput heuristic self-collapses to the bitrate floor under any
-    split that under-utilizes the network (goodput -> bitrate -> goodput
-    spiral), which traps ``path_only`` at the floor and masks the Path agent's
-    scheduling skill. Extra variants isolate the split under a bitrate driver
-    that does *not* collapse, so both offer the same realistic load and the QoE
-    gap reflects scheduling quality alone. Each pairs the learned split with a
-    matched-bitrate proportional-split reference at the same driver:
-
-    * ``path_only_cap`` / ``proportional_cap`` -- BDP capacity estimate
-      (:func:`_capacity_bitrate`, keyed off ``cwnd/sRTT``).
-    * ``path_only_gcc`` -- WebRTC-style GCC estimate (:class:`_GccBitrate`, a
-      stateful AIMD controller); its matched proportional-split reference is the
-      standalone ``webrtc`` baseline (same driver + split).
+    * ``app_only``      -- Path agent disabled: learned bitrate + even split.
+      Compare to ``even`` (same split, heuristic vs learned bitrate).
+    * ``path_only_gcc`` -- App agent disabled: learned per-path split under a
+      WebRTC-style GCC bitrate driver (:class:`_GccBitrate`, a stateful AIMD
+      controller). Unlike the reactive goodput heuristic -- which self-collapses
+      to the bitrate floor when a split under-utilizes the network
+      (goodput -> bitrate -> goodput spiral) and so would mask the Path agent's
+      scheduling skill -- GCC probes for capacity and holds a realistic load.
+      Its matched proportional-split reference is the standalone ``webrtc``
+      baseline (same driver + split), so the QoE gap reflects scheduling quality.
 
     A standalone ``webrtc`` baseline (GCC bitrate + proportional split) is always
     included, independent of ``ablation``.
@@ -456,20 +417,13 @@ def run_evaluation(
         policies["learned"] = (learned_bitrate, learned_split)
         if ablation:
             # Disable one agent at a time by substituting its heuristic.
-            policies["path_only"] = (bitrate_heur, learned_split)  # App off
             policies["app_only"] = (learned_bitrate, _even_split)  # Path off
-            # Non-collapsing variants: a bitrate driver that does not spiral to
-            # the floor, so the learned split runs at a realistic load and its
-            # scheduling contribution is not masked. Each pairs the learned split
-            # with a matched-bitrate heuristic-split reference at the same driver:
-            #   *_cap -> BDP capacity estimate (cwnd/sRTT)
-            #   *_gcc -> WebRTC GCC estimate (realistic, stateful AIMD)
-            bitrate_cap = _capacity_bitrate(cfg)
-            policies["path_only_cap"] = (bitrate_cap, learned_split)
-            policies["proportional_cap"] = (bitrate_cap, _proportional)
-            # GCC's matched proportional-split reference is the standalone
-            # ``webrtc`` baseline above (same driver + split), so it is not
-            # duplicated here.
+            # Path-agent-only: the learned split under a WebRTC GCC bitrate
+            # driver (stateful AIMD), which -- unlike the reactive goodput
+            # heuristic -- does not spiral to the bitrate floor when the split
+            # under-uses the network, so the split's scheduling contribution is
+            # not masked. Its matched proportional-split reference is the
+            # standalone ``webrtc`` baseline above (same driver + split).
             policies["path_only_gcc"] = (_GccBitrate(cfg), learned_split)
 
     summary: Dict[str, Dict] = {}
