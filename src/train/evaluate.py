@@ -95,6 +95,68 @@ def _capacity_bitrate(cfg: ExperimentConfig) -> BitrateFn:
     return fn
 
 
+# GCC / WebRTC constants (canonical libwebrtc values, applied per decision tick
+# since the App cadence ~ app_period_s ~ 1 s matches GCC's update period).
+_GCC_INCREASE = 1.08        # multiplicative increase when the link looks clear
+_GCC_LOSS_HI = 0.10         # loss above this -> loss-based decrease
+_GCC_LOSS_LO = 0.02         # loss below this -> allowed to increase
+_GCC_DELAY_BACKOFF = 0.85   # decrease target = 0.85 x received rate (delay overuse)
+_GCC_QUEUE_THRESH_MS = 50.0  # queuing delay (RTT over min-RTT) flagged as overuse
+
+
+class _GccBitrate:
+    """WebRTC-style Google Congestion Control bandwidth estimator.
+
+    A **stateful** AIMD controller — the realistic counterpart to the stateless
+    goodput/capacity heuristics. It carries its own estimate ``est`` and ramps
+    it up multiplicatively while the link looks clear, backing off only on
+    congestion signals, so (unlike the goodput heuristic) it *probes* for
+    capacity and never spirals to the floor when the current split under-uses
+    the network. Each tick (one App decision) combines the two classic GCC
+    controllers, taking the more conservative move:
+
+    * **loss-based** — ``loss > 10%`` -> ``est *= (1 - 0.5*loss)``;
+      ``loss < 2%`` -> eligible to increase.
+    * **delay-based** — queuing delay (current RTT over the tracked min-RTT)
+      above a threshold is treated as overuse -> back off to
+      ``0.85 x received_rate`` (received rate is only read on this back-off
+      branch, exactly as in WebRTC, so it cannot drive the estimate down when
+      the app is merely under-sending).
+
+    Otherwise the estimate increases by 8%. The received rate uses aggregate
+    goodput (``throughput_mbps``); the delay signal uses aggregate RTT. Holds
+    state across frames; :meth:`reset` re-arms it per episode.
+    """
+
+    def __init__(self, cfg: ExperimentConfig):
+        self.cfg = cfg
+        self.reset()
+
+    def reset(self) -> None:
+        self._est = float(self.cfg.video.init_bitrate_kbps)
+        self._min_rtt_ms = float("inf")
+
+    def __call__(self, obs: FrameObs) -> float:
+        rtt = float(obs.rtt_ms)
+        if rtt > 0.0:
+            self._min_rtt_ms = min(self._min_rtt_ms, rtt)
+        loss = float(obs.loss)
+        recv_kbps = float(obs.throughput_mbps) * 1000.0
+        queue_ms = rtt - self._min_rtt_ms if np.isfinite(self._min_rtt_ms) else 0.0
+        overuse = queue_ms > _GCC_QUEUE_THRESH_MS
+
+        if loss > _GCC_LOSS_HI:                      # loss-based decrease
+            self._est *= (1.0 - 0.5 * loss)
+        elif overuse and recv_kbps > 0.0:            # delay-based decrease
+            self._est = min(self._est, _GCC_DELAY_BACKOFF * recv_kbps)
+        elif loss < _GCC_LOSS_LO and not overuse:    # increase (probe up)
+            self._est *= _GCC_INCREASE
+        # else: hold.
+
+        self._est = self.cfg.video.clamp_bitrate(self._est)
+        return self._est
+
+
 def _active_mask(obs: FrameObs) -> np.ndarray:
     """Boolean-as-float live-path mask; all-ones when the backend reports none."""
     pa = obs.path_active
@@ -165,6 +227,11 @@ def _rollout(
     heuristic compute — i.e. the real cost each method pays to make a decision.
     """
     obs = env.reset(seed=seed)
+    # Stateful bitrate controllers (e.g. GCC) carry an estimate across frames;
+    # re-arm per episode so state does not leak between rollouts. Stateless
+    # heuristics have no reset() and are unaffected.
+    if hasattr(bitrate_fn, "reset"):
+        bitrate_fn.reset()
     target = obs.current_bitrate_kbps
     # Episode-relative time origin. The NS-3 sim clock is monotonic across
     # episodes/methods (it does not reset on ACT_RESET), so record time relative
@@ -345,14 +412,19 @@ def run_evaluation(
     The reactive goodput heuristic self-collapses to the bitrate floor under any
     split that under-utilizes the network (goodput -> bitrate -> goodput
     spiral), which traps ``path_only`` at the floor and masks the Path agent's
-    scheduling skill. Two extra variants isolate the split under a
-    *capacity-based* bitrate (:func:`_capacity_bitrate`, keyed off ``cwnd/sRTT``)
-    that does not collapse, so both offer the same realistic load and the QoE
-    gap reflects scheduling quality alone:
+    scheduling skill. Extra variants isolate the split under a bitrate driver
+    that does *not* collapse, so both offer the same realistic load and the QoE
+    gap reflects scheduling quality alone. Each pairs the learned split with a
+    matched-bitrate proportional-split reference at the same driver:
 
-    * ``path_only_cap`` -- capacity-based bitrate + learned split.
-    * ``proportional_cap`` -- capacity-based bitrate + proportional split
-      (the matched-bitrate reference for ``path_only_cap``).
+    * ``path_only_cap`` / ``proportional_cap`` -- BDP capacity estimate
+      (:func:`_capacity_bitrate`, keyed off ``cwnd/sRTT``).
+    * ``path_only_gcc`` -- WebRTC-style GCC estimate (:class:`_GccBitrate`, a
+      stateful AIMD controller); its matched proportional-split reference is the
+      standalone ``webrtc`` baseline (same driver + split).
+
+    A standalone ``webrtc`` baseline (GCC bitrate + proportional split) is always
+    included, independent of ``ablation``.
     """
     if use_learned_vmaf is not None:
         cfg.use_learned_vmaf = bool(use_learned_vmaf)
@@ -372,6 +444,10 @@ def run_evaluation(
         "single": (bitrate_heur, _single_best),
         "proportional": (bitrate_heur, _proportional),
         "random": (bitrate_heur, _random_split(seed)),
+        # WebRTC-style baseline: GCC bandwidth estimate + proportional multipath
+        # split (the closest standard scheduler to a real deployment). Each GCC
+        # instance is stateful, so give every policy its own.
+        "webrtc": (_GccBitrate(cfg), _proportional),
     }
     if app_ckpt and path_ckpt:
         learned_bitrate, learned_split = _learned_policies(
@@ -382,14 +458,19 @@ def run_evaluation(
             # Disable one agent at a time by substituting its heuristic.
             policies["path_only"] = (bitrate_heur, learned_split)  # App off
             policies["app_only"] = (learned_bitrate, _even_split)  # Path off
-            # Non-collapsing variants: capacity-based bitrate so the learned
-            # split runs at a realistic load and its scheduling contribution is
-            # not masked by the goodput heuristic's floor spiral. proportional
-            # is the matched-bitrate reference (same capacity bitrate, hand-
-            # crafted throughput-proportional split).
+            # Non-collapsing variants: a bitrate driver that does not spiral to
+            # the floor, so the learned split runs at a realistic load and its
+            # scheduling contribution is not masked. Each pairs the learned split
+            # with a matched-bitrate heuristic-split reference at the same driver:
+            #   *_cap -> BDP capacity estimate (cwnd/sRTT)
+            #   *_gcc -> WebRTC GCC estimate (realistic, stateful AIMD)
             bitrate_cap = _capacity_bitrate(cfg)
             policies["path_only_cap"] = (bitrate_cap, learned_split)
             policies["proportional_cap"] = (bitrate_cap, _proportional)
+            # GCC's matched proportional-split reference is the standalone
+            # ``webrtc`` baseline above (same driver + split), so it is not
+            # duplicated here.
+            policies["path_only_gcc"] = (_GccBitrate(cfg), learned_split)
 
     summary: Dict[str, Dict] = {}
     distributions: Dict[str, Dict] = {}
