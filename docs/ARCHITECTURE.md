@@ -178,13 +178,25 @@ drives a 6-path set (§5.3.1). The repo's `configs/default.yaml` retains the leg
 3-path topology for quick mock-only experiments; it now also runs as 3 paths on
 NS-3 (previously the body ignored the YAML and always built its 4-path default).
 
-A subflow is thus a stock single-path NS-3 TCP connection (`TcpSocketFactory`,
-the build's default congestion control). The "multipath QUIC" property lives one
-layer up, in the controller, which splits each video frame's bytes across the `N`
-subflows. The mapping to true MPQUIC is: *subflow ↔ QUIC path; the controller's
-per-frame byte split ↔ the QUIC packet scheduler's path choice; TCP's
-loss-recovery ↔ QUIC's per-path reliability.* See §11 for what this faithfully
-captures and what it does not.
+A subflow is by default a stock single-path NS-3 TCP connection
+(`TcpSocketFactory`, the build's default congestion control). The "multipath
+QUIC" property lives one layer up, in the controller, which splits each video
+frame's bytes across the `N` subflows. The mapping to true MPQUIC is: *subflow ↔
+QUIC path; the controller's per-frame byte split ↔ the QUIC packet scheduler's
+path choice; TCP's loss-recovery ↔ QUIC's per-path reliability.* See §11 for what
+this faithfully captures and what it does not.
+
+**Selectable per-path transport (`transport: tcp | udp`).** The subflow protocol
+is a config knob (`run.transport`, forwarded to the body; `--ns3-transport` on the
+CLIs overrides it). `"tcp"` (default) is byte-identical to the historical scenario
+— reliable, in-order, retransmitting. `"udp"` swaps each subflow for an unreliable
+datagram flow with **explicit app-layer deadline drop**: `RealtimeSource::DrainUdp`
+fragments a frame's share into ≤1400 B datagrams, each carrying a fixed 24-byte
+`UdpFrameHeader` (frame id, generation time, offsets), and *writes off any share
+that has already gone stale (past its deadline) before it is sent* rather than
+retransmitting it. This is the closer analogue to QUIC's unreliable-datagram mode
+(loss is loss, not added latency); the mock backend is already UDP-like, so
+`transport` is ignored there.
 
 ### 3.2 Background (cross) traffic
 
@@ -198,6 +210,14 @@ s, off-mean `0.8 + 0.3·i` s). The effect is that each path's *available* capaci
 fluctuates burstily and the paths' good/bad periods are decorrelated, so the
 Transport agent faces a genuinely non-stationary, path-heterogeneous scheduling
 problem rather than a static capacity assignment.
+
+Under **dynamics** (§3.9) the stock `OnOffApplication` is replaced by a custom
+rescale-safe `CrossTrafficApp` with the same on/off shape, because
+`OnOffApplication` carries residual-bits bookkeeping that drifts and eventually
+`NS_FATAL`s when its `DataRate` is rescaled every frame; `CrossTrafficApp`
+schedules each packet from the *current* rate with no residual state, so its rate
+can track the dynamic capacity multiplier safely. The static scenario keeps the
+stock `OnOffApplication` and is byte-identical to before.
 
 ### 3.3 The real-time video source model
 
@@ -304,7 +324,10 @@ could read from its sockets:
   `lost / (tx + lost)` over the path's TCP flow. Because a full `FlowMonitor`
   sweep is comparatively expensive and the bridge runs every 33 ms, this sweep is
   **throttled to the 1 s app cadence** and cached between sweeps — a deliberate
-  cost/fidelity trade documented in the code.
+  cost/fidelity trade documented in the code. Under dynamics the monitor's
+  `MaxPerHopDelay` is lowered to the frame deadline (from FlowMonitor's default
+  10 s) so a packet counts as lost once it is deadline-late — the real-time
+  semantics — and the windowed loss estimate reacts within an app period.
 
 ### 3.7 The decision loop and episode lifecycle
 
@@ -377,28 +400,57 @@ same draw order as the mock — regime, burst, correlation, churn), from a
 **dedicated NS-3 RNG stream** seeded by the scenario `seed` so the frame-size
 jitter stream is unperturbed and runs stay deterministic per seed:
 
-- **Churn.** A per-path on/off Markov chain (floored at `minActive`). A churned-out
-  path collapses its NS-3 link (`DataRate → ~0`) *and* has any bytes the scheduler
-  routes onto it dropped at the app layer and counted as loss — the same penalty
-  the mock applies (`CompleteFrame` folds the dropped fraction into the frame's
-  loss; a whole-frame-on-dead-paths is an immediate deadline miss). It reports a
-  dead per-path row and `pathActive = 0`.
+- **Churn.** A per-path on/off Markov chain (floored at `minActive`). Liveness is
+  **not** expressed by collapsing the link `DataRate` — that would strand a packet
+  mid-serialization and zombie the device for seconds after revival. Instead a
+  churned-out path is silenced by **drop-all receive error models** on *both*
+  directions of the link (data and ACKs): packets keep serializing at the normal
+  rate and simply die at the receiver, so a revived path is usable instantly. On
+  churn-out the TCP subflow is **torn down** (its still-queued shares are written
+  off as dropped via `WriteOffPathShares`, so a frame whose last outstanding share
+  was on that path completes immediately with the loss); on revival it is
+  **reconnected** with the send-buffer and watermark space reset to zero in
+  lockstep with the sink (UDP mode needs no connection handling — in-flight
+  fragments die at the error model and stale shares are written off by `DrainUdp`'s
+  deadline check). Any bytes the scheduler routes onto a dead path are counted as
+  loss (`CompleteFrame` folds the dropped fraction in, exactly like the mock), and
+  the path reports a dead per-path row and `pathActive = 0`.
 - **Regime / burst / correlated failures.** These scale the per-path bottleneck
   `DataRate` by the same multiplier logic as the mock's `_cap_mult`
   (`regime_mult × burst_mult × corr_mult`), reapplied to the live NS-3 devices each
-  frame, so per-path throughput/RTT reflect the shift/collapse.
+  frame (`ApplyPathRate`). The **cross-traffic rate is scaled by the same
+  multiplier**, so background load stays a fixed *fraction* of the current capacity
+  (multiplicative semantics, mirroring the mock's `base·(1−cross)·mult`).
+- **Seasonal capacity envelope.** Under dynamics the body also mirrors the mock's
+  smooth sinusoidal capacity envelope + per-frame noise (`EnvelopeMult`, folded
+  into `ApplyPathRate` alongside the multiplier above). The amp/period/phase
+  formulas and the noise σ (0.05) are duplicated from `ExperimentConfig.mock_dataplane`
+  in `src/train/config.py` and **must be kept in sync**. Without it, NS-3 per-path
+  headroom never dips near an even-split share and the app-only ablation trivially
+  matches the full system. (The mock's analytic cross-traffic sinusoid is *not*
+  duplicated — the real `CrossTrafficApp` already provides that competition.)
 
-Episodes reset the dynamic state in-band (all paths live again, regime multipliers
-resampled) alongside the existing counter/EWMA reset (§3.7).
+Additionally, every path carries a **WebRTC-style backlog bound** (`m_maxBufferBytes`,
+one deadline's worth of bytes at the nominal rate): a stalled or throttled path
+drops fresh shares instead of accumulating unbounded stale backlog that would burst
+out and desync delivery on recovery.
+
+Episodes reset the dynamic state in-band (all paths revived through the full
+transition, regime multipliers resampled, burst/correlation timers cleared)
+alongside the existing counter/EWMA reset (§3.7); the dynamics RNG stream continues
+across episodes so runs stay deterministic per seed.
 
 **Where the body only approximates the mock.** (i) The two backends draw from
 independent RNG streams, so they are *behaviorally* equivalent but **not**
 frame-identical. (ii) Per-path throughput/RTT evolve through NS-3's real transport
-(TCP over the modulated bottleneck) rather than the mock's analytical standing
+(TCP/UDP over the modulated bottleneck) rather than the mock's analytical standing
 queue, so aggregate magnitudes differ even when the dynamics match. (iii)
 Correlated-failure group indices `≥` the topology's path count are dropped — a
 non-issue now that the topology is forwarded (§3.1), so `configs/dynamic.yaml`'s
 `corr_groups: [[4, 5]]` is in-range on the 6-path NS-3 set.
+`scripts/parity_check.py` is the CI guard for this contract: it runs the same
+neutral even-split policy through both backends (mock in-process, NS-3 via
+`--selftest`) and asserts the loss regimes match.
 
 ---
 
@@ -481,7 +533,8 @@ realized result* (its `last_*` fields), with the next observation available via
 
 A thin marshaller over §4: it imports the pybind `.so`, launches the process,
 forwards episode parameters (fps, episode length, app period, deadline, bitrate
-bounds, seed), the `topology:` path list, and — when enabled — the `dynamics:`
+bounds, seed, and the per-path `transport` protocol `tcp`/`udp`), the `topology:`
+path list, and — when enabled — the `dynamics:`
 parameters (§3.9) as CLI flags, and translates between `FrameObs`/`FrameResult`
 and the shared structs (including reading the per-path liveness mask from
 `EnvStruct.pathActive[]` into `FrameObs.path_active`). `reset` either launches the
@@ -666,13 +719,22 @@ grid box.
 Because the learned VMAF **already folds loss into the quality score**, the
 explicit `− d·loss` penalty is **dropped** under the learned reward to avoid
 double-counting; the latency/jitter penalties are **kept** (the current model does
-not separate those — see the grid caveat below). Concretely, the App reward is
-selected by which quality model is active:
+not separate those — see the grid caveat below). The learned surrogate also adds a
+**utilization term** `+ e·(1−loss)·util` (with `util = clip(bitrate/util_norm, 0,
+1)`, `util_norm` the ~3300 kbps quality knee, default `e_util = 0.25` in the
+four-path/dynamic configs): the shipped grid is nearly bitrate-flat, so it erases
+the "more delivered bits is good" gradient that the log curve supplies natively;
+the utilization reward restores it, gated by `(1−loss)` so it only pays for bits
+that land on time (the agent must aggregate paths to earn it without eating
+latency/loss). The term is **only applied with a learned scorer** (the log curve is
+already bitrate-sensitive) and defaults to off (`e_util = 0.0`) unless enabled in
+config. Concretely, the App reward is selected by which quality model is active:
 
 ```
 default (log curve):  QoE = a·VMAF(bitrate)/100 − b·lat − c·jit − d·loss
 learned surrogate:    QoE = a·VMAF(bitrate, loss, delay, jitter)/100 − b·lat − c·jit
-                            (no explicit − d·loss term; loss enters via VMAF)
+                            + e·(1−loss)·util   (no explicit − d·loss term; loss
+                                                 enters via VMAF and the util gate)
 ```
 
 with `lat`, `jit` the same normalized, soft-capped penalties in both cases, and
@@ -1015,13 +1077,15 @@ quality/latency/loss tensions a real conferencing sender faces. The
 observation/reward contract and the QoE functional are exactly the quantities the
 problem statement specifies.
 
-**What it abstracts away.** (i) *Transport identity:* subflows are TCP, not QUIC;
-this preserves congestion/queue/loss behavior but not QUIC specifics (0-RTT,
-stream multiplexing, connection migration, packet-number spaces). (ii)
-*Reliability semantics:* TCP recovers loss via retransmission, so network loss
-surfaces as latency, and *application* loss is modeled as deadline misses — a
-deliberate, and arguably correct, real-time framing, but not identical to an
-unreliable-datagram transport. (iii) *Reordering across paths:* the byte-watermark
+**What it abstracts away.** (i) *Transport identity:* subflows are TCP (default)
+or plain UDP (`transport: udp`), not QUIC; this preserves congestion/queue/loss
+behavior but not QUIC specifics (0-RTT, stream multiplexing, connection migration,
+packet-number spaces). (ii) *Reliability semantics:* under the default TCP,
+loss is recovered via retransmission, so network loss surfaces as latency, and
+*application* loss is modeled as deadline misses — a deliberate, and arguably
+correct, real-time framing; the optional UDP mode instead drops stale/late shares
+outright (`DrainUdp`), the closer analogue to an unreliable-datagram transport, but
+still without QUIC's per-stream reliability. (iii) *Reordering across paths:* the byte-watermark
 tracker measures per-path completion and aggregates to a frame; it does not model
 application-layer resequencing cost beyond the max-arrival latency. (iv)
 *Single client/server.* The topology is a single client↔server dumbbell of `N`
@@ -1077,6 +1141,7 @@ mobility per episode for domain randomization.
 | fps / app period / deadline | 30 / 1 s / 180 ms | `configs/default.yaml`, C++ CLI |
 | bitrate range / init | 300–6000 / 1500 kbps | `video` |
 | reward weights `a,b,c,d` | 1.0, 0.5, 0.5, 1.0 | `reward` |
+| utilization reward `e_util` / `util_norm_kbps` | 0.0 (off) / 3300 kbps; `0.25` in four-path/dynamic configs (learned-VMAF only) | `QoEWeights`, `reward` |
 | latency / jitter normalizers | 200 / 50 ms | `QoEWeights` |
 | VMAF anchors (default log curve) | (300, 25), (4300, 92) | `qoe.py` |
 | learned VMAF | off by default; `--learned-vmaf` / `reward.use_learned_vmaf` | `learned_vmaf.py`, `reward_model.npz` |
@@ -1086,6 +1151,7 @@ mobility per episode for domain randomization.
 | cwnd / buffer obs normalizers | 200 000 B | `realtime_env.py` |
 | `transport_arch` | `flat` (default) / `scoring` | `configs/*.yaml` `run:` |
 | `dynamics` (churn/regime/burst/corr) | off by default (both backends); on in `configs/dynamic.yaml` | `DynamicsConfig`, `dataplane.py`, `realtime_mpquic.cc` |
+| `transport` (NS-3 per-path protocol) | `tcp` (default) / `udp`; `--ns3-transport` overrides | `configs/*.yaml` `run:`, C++ CLI |
 | paths (rate/delay/cross), NS-3 | built-in default 3/3/2.5/2 Mbps · 10/15/40/20 ms · 0.40/0.45/0.30/0.55; overridable via forwarded `topology:` | `ScenarioConfig`, `configs/*.yaml` |
 | `cap_mbps` (throughput normalizer) | 12 (4-path) / 10 (legacy 3-path) | `configs/*.yaml` |
 | paths (rate/delay/cross), legacy mock | 8/4/2 Mbps · 10/17/30 ms · 0.45/0.65/0.35 | `configs/default.yaml` |
@@ -1096,12 +1162,14 @@ mobility per episode for domain randomization.
 | Path | Role |
 |---|---|
 | `ns3/realtime_mpquic.h` | `EnvStruct`/`ActStruct` wire contract |
-| `ns3/realtime_mpquic.cc` | NS-3 scenario: topology, subflows, frame generation, striping, completion tracking, decision loop, non-stationary dynamics (§3.9) |
+| `ns3/realtime_mpquic.cc` | NS-3 scenario: topology, TCP/UDP subflows, frame generation, striping, completion tracking, decision loop, non-stationary dynamics (§3.9) |
 | `ns3/realtime_mpquic_py.cc` | pybind11 binding of the structs + interface |
 | `ns3/CMakeLists.txt`, `scripts/install_ns3_example.sh` | build + install into ns-3-dev |
+| `scripts/parity_check.py` | mock⇄NS-3 parity guard (even-split loss regimes must match) |
+| `scripts/wedge_repro.py` | minimal repro for the churn/rescale wedge failure modes |
 | `src/ns3env/dataplane.py` | `DataPlane` ABC, `MockRealtimeDataPlane`, `Ns3DataPlane`, `FrameObs`/`FrameResult` |
 | `src/ns3env/video_source.py` | frame-size model (mirrors C++) |
-| `src/ns3env/qoe.py` | VMAF curve, App QoE reward (pluggable `vmaf_fn`), transport reward |
+| `src/ns3env/qoe.py` | VMAF curve, App QoE reward (pluggable `vmaf_fn`, optional utilization term), transport reward |
 | `src/ns3env/qos_vmaf_reward.py` + `reward_model.npz` | vendored learned QoS→VMAF surrogate (from `WebRTC-QoE-Data-Generator`) |
 | `src/ns3env/learned_vmaf.py` | adapter: learned surrogate → `vmaf_fn` (unit translation) |
 | `src/ns3env/realtime_env.py` | observation builders, reward windows |
@@ -1112,8 +1180,10 @@ mobility per episode for domain randomization.
 | `src/train/config.py` | YAML → typed config; backend factories |
 | `src/train/hierarchical_train.py` | dual-cadence training loop |
 | `src/train/evaluate.py` | rollout + baselines |
-| `train.py`, `evaluate.py` | thin CLIs |
+| `train.py`, `evaluate.py` | thin CLIs (incl. `--ns3-transport tcp|udp`) |
+| `evaluation/generate_figures.py` | post-hoc figure/plot generation from eval outputs |
 | `configs/dynamic.yaml` | non-stationary, variable-path-count scenario (`transport_arch: scoring`) |
+| `docs/TUNING_DYNAMICS.md` | practical guide to tuning the dynamics parameters |
 | `tests/` | mock-only unit + smoke tests (incl. `test_dynamics.py`, `test_scoring_agent.py`) |
 
 ---
