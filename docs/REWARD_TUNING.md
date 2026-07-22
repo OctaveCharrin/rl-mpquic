@@ -204,8 +204,91 @@ Pensieve/RTC rationale). Adopt `b = c = 0.5` as the working default, documented
 as **provisional pending the §5B calibration**. Treat §5D as the roadmap item
 that makes the weights defensible rather than merely reasonable.
 
+## 7. Role / use-case coefficient profiles
+
+The coefficients above describe *one* operating point. But a video-conferencing
+endpoint plays different roles, and the right QoS tradeoff **depends on the role
+of the flow** — this is not a heuristic, it is the model of **ITU-T G.1010**
+("End-user multimedia QoS categories"), which defines application categories
+distinguished precisely by their tolerance to delay and loss, and explicitly
+separates *conversational videophone* from *one-way video* ("more tolerance for
+delay since there is no direct conversation involved"). The governing variable is
+**interactivity**.
+
+**Framing.** This pipeline controls the *sender* side (App sets the encoder
+bitrate, Path sets the split, reward is measured at delivery). We never optimize
+a receiver directly, so a profile is keyed on the **use-case of the flow**
+(interactive / presenting / passive), not a literal sender-vs-receiver bit — a
+receiver's needs enter as the requirements of the stream we send it.
+
+**A profile is a bundle**, not just weights: the most role-sensitive knob is
+`deadline_ms` (currently a single global in `ExperimentConfig` /
+`MockRealtimeConfig` / `Ns3Config`, not in `QoEWeights`). A profile therefore
+bundles the `QoEWeights` fields **and** `deadline_ms`. `a_quality` stays the
+numeraire (`= 1`) in every profile so the weights remain comparable; the role
+difference is carried by `b`, `c`, `d`, the normalizers, and the deadline.
+
+### Starter profiles
+
+Provisional values, to be calibrated per profile with the §5 protocol. Rationale
+below the table.
+
+| Profile | G.1010 class | a | b (lat) | c (jit) | d (loss) | latency_norm_ms (2× cap) | jitter_norm_ms | deadline_ms |
+|---------|--------------|---|---------|---------|----------|--------------------------|----------------|-------------|
+| **interactive** (two-way talking heads) | conversational videophone | 1.0 | 0.5 | 0.5 | 1.0 | 200 (→400) | 50 | 180 |
+| **presenter** (screen-share / slides → attendees) | one-way video | 1.0 | 0.2 | 0.2 | 1.0 | 400 (→800) | 100 | 400 |
+| **passive** (low-priority secondary camera / view-only) | background / streaming | 1.0 | 0.1 | 0.3 | 0.7 | 800 (→1600) | 150 | 800 |
+
+- **interactive** — the current default. Conversational two-way video is the
+  most delay-sensitive class: `latency_norm = 200` pins the penalty to G.114's
+  150/400 ms band, `deadline = 180` sits inside it, and `d = 1` (loss dominant)
+  because a late frame cannot be retransmitted in a live conversation.
+- **presenter** — an *active presenter* sends mostly one-way content to
+  attendees who can buffer, so the delay budget widens (looser `latency_norm`,
+  `deadline = 400`) and delay/jitter are downweighted (`b = c = 0.2`). But
+  screen-share/slide content is text-heavy and G.1010 puts one-way/streaming
+  video at *near-zero loss tolerance*, so `d` stays high (`= 1`) — a dropped
+  slide region is unreadable. Effectively a quality-and-integrity-first,
+  delay-relaxed point.
+- **passive** — the endpoint's own low-value outbound stream (e.g. an attendee's
+  camera thumbnail), or a view-only feed. Delay is nearly irrelevant (`b = 0.1`,
+  `deadline = 800`); continuity/smoothness matters more than instantaneous
+  latency, so jitter keeps modest weight (`c = 0.3`); and because the stream
+  itself is low-priority, even loss is relaxed (`d = 0.7`) so it yields path/rate
+  budget to higher-value flows.
+
+### Implementation levels
+
+Three options, increasing power and cost. `QoEWeights` is already a per-run
+dataclass loaded from the `reward:` YAML block, so this extends the existing
+structure rather than rewriting it.
+
+1. **Static named profiles (recommended first).** Ship
+   `configs/profiles/{interactive,presenter,passive}.yaml` (or a `profile:` key
+   selecting a preset), each carrying its `reward:` weights **and** `deadline_ms`.
+   Calibrate each once via §5B. Low risk, standards-backed, immediately useful.
+2. **Role-conditioned single policy (the upgrade).** Feed the profile into the
+   observation — a one-hot role, or the weight vector itself — so a *single* agent
+   learns role-appropriate behavior (contextual / multi-task RL). Fits the
+   existing `build_path_state` global-context slot and the App observation, and it
+   natively handles roles that **change mid-call** (an attendee starts presenting
+   → the context input flips, no policy swap). Harder to train: pair with domain
+   randomization over roles and return scaling (see `docs/RL_AGENT_DESIGN.md`
+   §3 Tier-2 #7, Tier-3 #9), since reward magnitudes differ across profiles.
+3. **Separate policies per role.** Simplest to reason about, most memory, no
+   transfer between roles.
+
+**Mid-call role changes** are an *event*, not a static session property
+(presenter hand-off). Level 1 needs an explicit profile switch at that moment (a
+natural App-cadence decision); level 2 absorbs it through the context input. If
+live-meeting dynamics matter, that is the argument for level 2 — but ship level 1
+as the calibrated, G.1010-grounded default first.
+
 ## References
 
+- ITU-T G.1010, *End-user multimedia QoS categories* (application classes by
+  delay/loss tolerance; conversational vs one-way video).
+  <https://www.itu.int/rec/t-rec-g.1010-200111-i>
 - Y. Shen et al., "Mortise: Auto-tuning Congestion Control to Optimize QoE via
   Network-Aware Parameter Optimization," USENIX NSDI 2026.
   <https://www.usenix.org/conference/nsdi26/presentation/shen-yixin>
