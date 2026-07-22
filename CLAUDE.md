@@ -31,7 +31,13 @@ side is the "brain"; the C++ NS-3 scenario is a thin "body".
 - `src/rl/` — generic flat `SACAgent` and permutation-equivariant
   `ScoringSACAgent` (both in normalized `[-1,1]` action space), plus the
   `AppAgent` / `PathAgent` wrappers that map to bitrate / split. The Path
-  wrapper dispatches on `arch` (`"flat"` | `"scoring"`).
+  wrapper dispatches on `arch` (`"flat"` | `"scoring"`). Sample-efficiency knobs
+  (all off by default → byte-identical to plain SAC; enabled in `dynamic.yaml`):
+  the **DroQ recipe** (`critic_layernorm`/`critic_dropout` + higher
+  `updates_per_step` UTD — LayerNorm goes to the critic only, never the policy
+  body) and **Prioritized Experience Replay** (`prioritized: true`, sum-tree
+  buffers in `replay_buffer.py`, IS-weighted critic loss, beta annealed via
+  `per_beta0`/`per_beta_steps`). Replay buffers persist across `--resume` (P3).
 - `src/train/` — config loader, the dual-cadence training loop, evaluation+baselines.
 - `train.py` / `evaluate.py` — thin CLIs only.
 
@@ -101,10 +107,15 @@ uv run python train.py --backend mock --episodes 50
 uv run python train.py --config configs/dynamic.yaml --backend mock --episodes 50
 uv run python evaluate.py --config configs/dynamic.yaml --backend mock \
     --app runs/<run>/app.pth --path runs/<run>/path.pth --ablation
+# multi-seed A/B "ruler" (cross-seed ablation + ranking stability + qoe_components
+# dump); add --app-b/--path-b for a before/after (e.g. baseline vs +DroQ) compare:
+uv run python scripts/ab_eval.py --config configs/dynamic.yaml \
+    --app runs/<run>/app.pth --path runs/<run>/path.pth --seeds 1000 2000 3000
 ```
 
 Training checkpoints every episode; `train.py --resume` continues from the latest
-(useful for interruptible/chunked runs).
+(useful for interruptible/chunked runs). Add `--persist-buffer` to save/restore
+the replay buffers too, so resumed updates continue instead of refilling cold.
 
 NS-3 changes require a rebuild: `scripts/install_ns3_example.sh` then
 `./ns3 run "ns3ai_realtime_mpquic --selftest"` to validate C++ alone before

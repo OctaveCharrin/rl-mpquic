@@ -197,6 +197,12 @@ def load_config(path: Optional[str] = None) -> ExperimentConfig:
         update_after=int(sac.get("update_after", 1_000)),
         updates_per_step=int(sac.get("updates_per_step", 1)),
         auto_entropy=bool(sac.get("auto_entropy", True)),
+        critic_layernorm=bool(sac.get("critic_layernorm", False)),
+        critic_dropout=float(sac.get("critic_dropout", 0.0)),
+        prioritized=bool(sac.get("prioritized", False)),
+        per_alpha=float(sac.get("per_alpha", 0.6)),
+        per_beta0=float(sac.get("per_beta0", 0.4)),
+        per_beta_steps=int(sac.get("per_beta_steps", 100_000)),
     )
 
     run = data.get("run", {})

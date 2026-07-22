@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .replay_buffer import ReplayBuffer
+from .replay_buffer import PrioritizedReplayBuffer, ReplayBuffer
 
 _LOG_STD_MIN = -20.0
 _LOG_STD_MAX = 2.0
@@ -39,20 +39,41 @@ class SACConfig:
     buffer_size: int = 200_000
     start_steps: int = 1_000      # uniform-random actions before this many stores
     update_after: int = 1_000     # min transitions before gradient updates begin
-    updates_per_step: int = 1
+    updates_per_step: int = 1     # UTD ratio; raise only with critic_layernorm
     auto_entropy: bool = True
     alpha: float = 0.2            # fixed temperature if auto_entropy is False
     device: Optional[str] = None  # "cpu" / "cuda"; auto-selected if None
+    # DroQ recipe (P1): normalize + regularize the critic so a high UTD ratio
+    # stays stable. Both default off => behavior byte-identical to plain SAC.
+    critic_layernorm: bool = False
+    critic_dropout: float = 0.0
+    # Prioritized Experience Replay (P2). Off => uniform sampling, byte-identical.
+    prioritized: bool = False
+    per_alpha: float = 0.6        # priority exponent (0 = uniform)
+    per_beta0: float = 0.4        # initial IS-correction exponent
+    per_beta_steps: int = 100_000  # anneal beta 0->1 over this many updates
 
 
-def _mlp(in_dim: int, hidden: int, out_dim: int) -> nn.Sequential:
-    return nn.Sequential(
-        nn.Linear(in_dim, hidden),
-        nn.ReLU(),
-        nn.Linear(hidden, hidden),
-        nn.ReLU(),
-        nn.Linear(hidden, out_dim),
-    )
+def _mlp(
+    in_dim: int,
+    hidden: int,
+    out_dim: int,
+    *,
+    layernorm: bool = False,
+    dropout: float = 0.0,
+) -> nn.Sequential:
+    """MLP with optional per-hidden-layer LayerNorm + Dropout (DroQ critic)."""
+    layers: list[nn.Module] = []
+    dims = (in_dim, hidden, hidden)
+    for i in range(len(dims) - 1):
+        layers.append(nn.Linear(dims[i], dims[i + 1]))
+        if layernorm:
+            layers.append(nn.LayerNorm(dims[i + 1]))
+        layers.append(nn.ReLU())
+        if dropout > 0.0:
+            layers.append(nn.Dropout(dropout))
+    layers.append(nn.Linear(hidden, out_dim))
+    return nn.Sequential(*layers)
 
 
 class GaussianPolicy(nn.Module):
@@ -87,10 +108,18 @@ class GaussianPolicy(nn.Module):
 class QNetwork(nn.Module):
     """Twin Q networks Q1, Q2 over (obs, action)."""
 
-    def __init__(self, obs_dim: int, act_dim: int, hidden: int):
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        hidden: int,
+        *,
+        layernorm: bool = False,
+        dropout: float = 0.0,
+    ):
         super().__init__()
-        self.q1 = _mlp(obs_dim + act_dim, hidden, 1)
-        self.q2 = _mlp(obs_dim + act_dim, hidden, 1)
+        self.q1 = _mlp(obs_dim + act_dim, hidden, 1, layernorm=layernorm, dropout=dropout)
+        self.q2 = _mlp(obs_dim + act_dim, hidden, 1, layernorm=layernorm, dropout=dropout)
 
     def forward(self, obs: torch.Tensor, act: torch.Tensor):
         x = torch.cat([obs, act], dim=-1)
@@ -109,8 +138,13 @@ class SACAgent:
         )
 
         self.policy = GaussianPolicy(obs_dim, act_dim, self.cfg.hidden_dim).to(self.device)
-        self.critic = QNetwork(obs_dim, act_dim, self.cfg.hidden_dim).to(self.device)
-        self.critic_target = QNetwork(obs_dim, act_dim, self.cfg.hidden_dim).to(self.device)
+        q_kwargs = dict(
+            layernorm=self.cfg.critic_layernorm, dropout=self.cfg.critic_dropout
+        )
+        self.critic = QNetwork(obs_dim, act_dim, self.cfg.hidden_dim, **q_kwargs).to(self.device)
+        self.critic_target = QNetwork(
+            obs_dim, act_dim, self.cfg.hidden_dim, **q_kwargs
+        ).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         for p in self.critic_target.parameters():
             p.requires_grad_(False)
@@ -125,8 +159,14 @@ class SACAgent:
         else:
             self.log_alpha = torch.log(torch.tensor(self.cfg.alpha, device=self.device))
 
-        self.buffer = ReplayBuffer(obs_dim, act_dim, self.cfg.buffer_size)
+        if self.cfg.prioritized:
+            self.buffer = PrioritizedReplayBuffer(
+                obs_dim, act_dim, self.cfg.buffer_size, alpha=self.cfg.per_alpha
+            )
+        else:
+            self.buffer = ReplayBuffer(obs_dim, act_dim, self.cfg.buffer_size)
         self._stores = 0
+        self._updates = 0  # gradient-step counter (drives PER beta annealing)
 
     @property
     def alpha(self) -> torch.Tensor:
@@ -173,8 +213,21 @@ class SACAgent:
 
     # -- learning ----------------------------------------------------------- #
 
+    def _beta(self) -> float:
+        """PER importance-sampling exponent, annealed ``per_beta0`` -> 1.0."""
+        frac = min(1.0, self._updates / max(1, self.cfg.per_beta_steps))
+        return self.cfg.per_beta0 + frac * (1.0 - self.cfg.per_beta0)
+
     def _update_once(self) -> Dict[str, float]:
-        obs, act, rew, next_obs, done = self.buffer.sample(self.cfg.batch_size)
+        self._updates += 1
+        if self.cfg.prioritized:
+            obs, act, rew, next_obs, done, indices, weights = self.buffer.sample(
+                self.cfg.batch_size, self._beta()
+            )
+            weights = torch.as_tensor(weights, device=self.device)
+        else:
+            obs, act, rew, next_obs, done = self.buffer.sample(self.cfg.batch_size)
+            indices, weights = None, None
         obs = torch.as_tensor(obs, device=self.device)
         act = torch.as_tensor(act, device=self.device)
         rew = torch.as_tensor(rew, device=self.device)
@@ -189,10 +242,19 @@ class SACAgent:
             target = rew + self.cfg.gamma * (1.0 - done) * q_t
 
         q1, q2 = self.critic(obs, act)
-        critic_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
+        if self.cfg.prioritized:
+            td1, td2 = q1 - target, q2 - target
+            critic_loss = (weights * (td1.pow(2) + td2.pow(2))).mean()
+        else:
+            critic_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
         self.critic_opt.zero_grad()
         critic_loss.backward()
         self.critic_opt.step()
+
+        if self.cfg.prioritized:
+            with torch.no_grad():
+                td = torch.maximum((q1 - target).abs(), (q2 - target).abs())
+            self.buffer.update_priorities(indices, td.squeeze(-1).cpu().numpy())
 
         # --- actor ---
         new_act, logp, _ = self.policy.sample(obs)
@@ -240,3 +302,18 @@ class SACAgent:
         self.critic_target.load_state_dict(sd["critic_target"])
         with torch.no_grad():
             self.log_alpha.copy_(torch.as_tensor(sd["log_alpha"], device=self.device))
+
+    # -- replay-buffer persistence (P3) ------------------------------------- #
+
+    def save_buffer(self, path: str) -> None:
+        """Persist the replay buffer + ``_stores``/``_updates`` counters to ``path``."""
+        self.buffer.save(path, stores=self._stores, updates=self._updates)
+
+    def load_buffer(self, path: str) -> None:
+        """Restore the replay buffer and the ``_stores``/``_updates`` counters.
+
+        Restoring ``_updates`` keeps PER's beta annealing (see ``_beta``) on its
+        original schedule across ``--resume`` instead of restarting from
+        ``per_beta0`` — i.e. a fully faithful resume.
+        """
+        self._stores, self._updates = self.buffer.load(path)

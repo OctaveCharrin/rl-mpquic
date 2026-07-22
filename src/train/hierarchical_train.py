@@ -74,6 +74,8 @@ def run_training(
     log_every: int = 1,
     use_learned_vmaf: Optional[bool] = None,
     resume: bool = False,
+    persist_buffer: bool = False,
+    persist_buffer_every: int = 10,
 ) -> Dict[str, object]:
     """Train both agents; return a stats dict (also written to disk)."""
     episodes = int(episodes if episodes is not None else cfg.episodes)
@@ -112,19 +114,41 @@ def run_training(
 
     app_ckpt = os.path.join(out_dir, "app.pth")
     path_ckpt = os.path.join(out_dir, "path.pth")
+    app_buf = os.path.join(out_dir, "app_buffer.npz")
+    path_buf = os.path.join(out_dir, "path_buffer.npz")
 
-    def _save_ckpts() -> None:
+    def _save_ckpts(save_buffers: bool = False) -> None:
         torch.save(app.sac.state_dict(), app_ckpt)
         torch.save(path_agent.sac.state_dict(), path_ckpt)
+        # Buffers are large (up to buffer_size rows); only persist them on the
+        # requested cadence, not after every episode.
+        if save_buffers and persist_buffer:
+            app.sac.save_buffer(app_buf)
+            path_agent.sac.save_buffer(path_buf)
 
-    # Optional resume: reload the latest checkpoints and skip the uniform-random
-    # warm-up (the replay buffer restarts empty, so updates resume once it refills)
-    # — lets a long train be split across several shorter, interruptible runs.
+    # Optional resume: reload the latest checkpoints — lets a long train be split
+    # across several shorter, interruptible runs. With --persist-buffer the replay
+    # buffers are restored too (updates continue immediately); without them the
+    # buffer restarts empty, so we skip the uniform-random warm-up (the legacy
+    # cold-start hack) and let updates resume once it refills.
     if resume and os.path.exists(app_ckpt) and os.path.exists(path_ckpt):
         app.sac.load_state_dict(torch.load(app_ckpt, map_location="cpu"))
         path_agent.sac.load_state_dict(torch.load(path_ckpt, map_location="cpu"))
-        app.sac._stores = max(app.sac._stores, app.sac.cfg.start_steps)
-        path_agent.sac._stores = max(path_agent.sac._stores, path_agent.sac.cfg.start_steps)
+        buffers_restored = False
+        if persist_buffer and os.path.exists(app_buf) and os.path.exists(path_buf):
+            app.sac.load_buffer(app_buf)
+            path_agent.sac.load_buffer(path_buf)
+            buffers_restored = True
+            print(
+                f"restored replay buffers (app={len(app.sac.buffer)}, "
+                f"path={len(path_agent.sac.buffer)})",
+                flush=True,
+            )
+        if not buffers_restored:
+            app.sac._stores = max(app.sac._stores, app.sac.cfg.start_steps)
+            path_agent.sac._stores = max(
+                path_agent.sac._stores, path_agent.sac.cfg.start_steps
+            )
         print(f"resumed from checkpoints in {out_dir}", flush=True)
 
     history: List[Dict[str, float]] = []
@@ -133,8 +157,8 @@ def run_training(
             stats = _run_episode(env, app, path_agent, seed=base_seed + ep, episode=ep)
             history.append(stats)
             # Checkpoint after every episode so an interrupted run still leaves a
-            # usable (latest) model rather than nothing.
-            _save_ckpts()
+            # usable (latest) model rather than nothing. Buffers persist on cadence.
+            _save_ckpts(save_buffers=((ep + 1) % max(1, persist_buffer_every) == 0))
             if log_every and ep % log_every == 0:
                 print(
                     f"[ep {ep:3d}] QoE={stats['app_reward_mean']:+.3f} "
@@ -147,8 +171,8 @@ def run_training(
     finally:
         dp.close()
 
-    # Persist final checkpoints + stats.
-    _save_ckpts()
+    # Persist final checkpoints + stats (always flush buffers at the end).
+    _save_ckpts(save_buffers=True)
     result = {
         "backend": backend,
         "episodes": episodes,

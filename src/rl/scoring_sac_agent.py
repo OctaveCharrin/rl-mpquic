@@ -33,7 +33,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .replay_buffer import StructuredReplayBuffer
+from .replay_buffer import PrioritizedStructuredReplayBuffer, StructuredReplayBuffer
 from .sac_agent import SACConfig
 
 _LOG_STD_MIN = -20.0
@@ -43,13 +43,23 @@ _EPS = 1e-6
 _NEG_INF = -1e30
 
 
-def _encoder(in_dim: int, hidden: int) -> nn.Sequential:
-    return nn.Sequential(
-        nn.Linear(in_dim, hidden),
-        nn.ReLU(),
-        nn.Linear(hidden, hidden),
-        nn.ReLU(),
-    )
+def _encoder(
+    in_dim: int, hidden: int, *, layernorm: bool = False, dropout: float = 0.0
+) -> nn.Sequential:
+    """Two-layer per-path encoder with optional LayerNorm + Dropout.
+
+    The normalization flags are for the *critic only* (DroQ recipe, P1) — the
+    shared policy body always builds a plain encoder (flags default off).
+    """
+    layers: list[nn.Module] = []
+    for d_in in (in_dim, hidden):
+        layers.append(nn.Linear(d_in, hidden))
+        if layernorm:
+            layers.append(nn.LayerNorm(hidden))
+        layers.append(nn.ReLU())
+        if dropout > 0.0:
+            layers.append(nn.Dropout(dropout))
+    return nn.Sequential(*layers)
 
 
 class ScoringGaussianPolicy(nn.Module):
@@ -90,12 +100,21 @@ class ScoringGaussianPolicy(nn.Module):
 class ScoringQNetwork(nn.Module):
     """Twin DeepSets critics over (glob, paths, latent action), masked-mean pooled."""
 
-    def __init__(self, global_dim: int, path_dim: int, hidden: int):
+    def __init__(
+        self,
+        global_dim: int,
+        path_dim: int,
+        hidden: int,
+        *,
+        layernorm: bool = False,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         in_dim = global_dim + path_dim + 1  # + per-path action latent
-        self.enc1 = _encoder(in_dim, hidden)
+        enc_kw = dict(layernorm=layernorm, dropout=dropout)
+        self.enc1 = _encoder(in_dim, hidden, **enc_kw)
         self.head1 = nn.Linear(hidden, 1)
-        self.enc2 = _encoder(in_dim, hidden)
+        self.enc2 = _encoder(in_dim, hidden, **enc_kw)
         self.head2 = nn.Linear(hidden, 1)
 
     def _q(self, enc, head, x, mask):
@@ -140,9 +159,11 @@ class ScoringSACAgent:
         )
 
         h = self.cfg.hidden_dim
+        # LayerNorm/dropout go to the critic only, never the shared policy body.
+        q_kw = dict(layernorm=self.cfg.critic_layernorm, dropout=self.cfg.critic_dropout)
         self.policy = ScoringGaussianPolicy(global_dim, path_dim, h).to(self.device)
-        self.critic = ScoringQNetwork(global_dim, path_dim, h).to(self.device)
-        self.critic_target = ScoringQNetwork(global_dim, path_dim, h).to(self.device)
+        self.critic = ScoringQNetwork(global_dim, path_dim, h, **q_kw).to(self.device)
+        self.critic_target = ScoringQNetwork(global_dim, path_dim, h, **q_kw).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         for p in self.critic_target.parameters():
             p.requires_grad_(False)
@@ -159,10 +180,17 @@ class ScoringSACAgent:
         else:
             self.log_alpha = torch.log(torch.tensor(self.cfg.alpha, device=self.device))
 
-        self.buffer = StructuredReplayBuffer(
-            global_dim, path_dim, num_paths, self.cfg.buffer_size
-        )
+        if self.cfg.prioritized:
+            self.buffer = PrioritizedStructuredReplayBuffer(
+                global_dim, path_dim, num_paths, self.cfg.buffer_size,
+                alpha=self.cfg.per_alpha,
+            )
+        else:
+            self.buffer = StructuredReplayBuffer(
+                global_dim, path_dim, num_paths, self.cfg.buffer_size
+            )
         self._stores = 0
+        self._updates = 0  # gradient-step counter (drives PER beta annealing)
 
     @property
     def alpha(self) -> torch.Tensor:
@@ -204,8 +232,20 @@ class ScoringSACAgent:
 
     # -- learning ----------------------------------------------------------- #
 
+    def _beta(self) -> float:
+        """PER importance-sampling exponent, annealed ``per_beta0`` -> 1.0."""
+        frac = min(1.0, self._updates / max(1, self.cfg.per_beta_steps))
+        return self.cfg.per_beta0 + frac * (1.0 - self.cfg.per_beta0)
+
     def _update_once(self) -> Dict[str, float]:
-        batch = self.buffer.sample(self.cfg.batch_size)
+        self._updates += 1
+        if self.cfg.prioritized:
+            batch = self.buffer.sample(self.cfg.batch_size, self._beta())
+            indices = batch["indices"]
+            weights = torch.as_tensor(batch["weights"], device=self.device)
+        else:
+            batch = self.buffer.sample(self.cfg.batch_size)
+            indices, weights = None, None
         t = lambda k: torch.as_tensor(batch[k], device=self.device)  # noqa: E731
         glob, paths, mask, act = t("glob"), t("paths"), t("mask"), t("act")
         rew, done = t("rew"), t("done")
@@ -219,10 +259,19 @@ class ScoringSACAgent:
             target = rew + self.cfg.gamma * (1.0 - done) * q_t
 
         q1, q2 = self.critic(glob, paths, mask, act)
-        critic_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
+        if self.cfg.prioritized:
+            td1, td2 = q1 - target, q2 - target
+            critic_loss = (weights * (td1.pow(2) + td2.pow(2))).mean()
+        else:
+            critic_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
         self.critic_opt.zero_grad()
         critic_loss.backward()
         self.critic_opt.step()
+
+        if self.cfg.prioritized:
+            with torch.no_grad():
+                td = torch.maximum((q1 - target).abs(), (q2 - target).abs())
+            self.buffer.update_priorities(indices, td.squeeze(-1).cpu().numpy())
 
         # --- actor ---
         new_act, logp, _ = self.policy.sample(glob, paths, mask)
@@ -275,3 +324,18 @@ class ScoringSACAgent:
         self.critic_target.load_state_dict(sd["critic_target"])
         with torch.no_grad():
             self.log_alpha.copy_(torch.as_tensor(sd["log_alpha"], device=self.device))
+
+    # -- replay-buffer persistence (P3) ------------------------------------- #
+
+    def save_buffer(self, path: str) -> None:
+        """Persist the replay buffer + ``_stores``/``_updates`` counters to ``path``."""
+        self.buffer.save(path, stores=self._stores, updates=self._updates)
+
+    def load_buffer(self, path: str) -> None:
+        """Restore the replay buffer and the ``_stores``/``_updates`` counters.
+
+        Restoring ``_updates`` keeps PER's beta annealing (see ``_beta``) on its
+        original schedule across ``--resume`` instead of restarting from
+        ``per_beta0`` — i.e. a fully faithful resume.
+        """
+        self._stores, self._updates = self.buffer.load(path)

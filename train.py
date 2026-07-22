@@ -34,6 +34,13 @@ def main() -> None:
         action="store_true",
         help="reload latest checkpoints from --out-dir and continue training",
     )
+    p.add_argument(
+        "--persist-buffer",
+        action="store_true",
+        help="save/restore the replay buffers across --resume (writes "
+        "app_buffer.npz / path_buffer.npz); lets updates continue immediately "
+        "instead of refilling an empty buffer",
+    )
     p.add_argument("--show-output", action="store_true", help="stream NS-3 stdout/stderr")
     p.add_argument(
         "--learned-vmaf",
@@ -55,6 +62,7 @@ def main() -> None:
         show_output=args.show_output,
         use_learned_vmaf=args.learned_vmaf or None,
         resume=args.resume,
+        persist_buffer=args.persist_buffer,
     )
 
 

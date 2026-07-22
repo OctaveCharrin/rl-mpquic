@@ -80,7 +80,15 @@ sac:
   buffer_size: 200000
   start_steps: 1000
   update_after: 1000
-  updates_per_step: 1
+  # DroQ recipe (P1): critic LayerNorm lets us raise the update-to-data ratio for
+  # much faster sample efficiency on the dynamic scenario. Do NOT raise
+  # updates_per_step without critic_layernorm — a high UTD without normalization
+  # diverges.
+  updates_per_step: 10
+  critic_layernorm: true
+  # Prioritized Experience Replay (P2): focus learning on rare churn/regime/corr
+  # events. dropout stays 0 alongside PER (both add variance to the TD target).
+  prioritized: true
   auto_entropy: true
 
 run:

@@ -1,5 +1,10 @@
 # Patch Plan — Tier 1 Sample-Efficiency Upgrades
 
+**Status: implemented** (P1 critic LayerNorm + higher UTD, P2 Prioritized
+Experience Replay, P3 replay-buffer persistence across `--resume`). All flags
+default off (behavior byte-identical to plain SAC) and are enabled in
+`configs/dynamic.yaml`. See the ticked checklist below.
+
 **Audience:** a Claude instance (or engineer) implementing these changes later.
 This document is a self-contained work order. Read it top to bottom, then
 implement the three patches in the stated order. It assumes the code as of the
@@ -359,17 +364,17 @@ touch `docs/TUNING_DYNAMICS.md` if a new knob changes dynamics-tuning guidance.
 
 ## Files touched (checklist)
 
-- [ ] `src/rl/sac_agent.py` — `SACConfig` fields; `_mlp` norm; `QNetwork`/agent wiring; weighted loss (P2).
-- [ ] `src/rl/scoring_sac_agent.py` — `_encoder` norm (critic-only); agent wiring; weighted loss (P2).
-- [ ] `src/rl/replay_buffer.py` — `save`/`load` (P3); prioritized buffers + sum-tree (P2).
-- [ ] `src/train/config.py` — load new `sac:` keys (P1, P2).
-- [ ] `src/train/hierarchical_train.py` — buffer persistence + resume wiring (P3).
-- [ ] `train.py` — `--persist-buffer` flag (P3).
-- [ ] `configs/dynamic.yaml` — enable UTD/LayerNorm (P1), optionally PER (P2); comment the new keys.
-- [ ] `tests/` — acceptance tests for P1, P2, P3.
-- [ ] **Docs (final step):** `CLAUDE.md`, `docs/RL_AGENT_DESIGN.md`,
-      `docs/IMPLEMENTATION.md`, `docs/ARCHITECTURE.md` — reflect the shipped
-      behavior; add a "Status: implemented" line to this file.
+- [x] `src/rl/sac_agent.py` — `SACConfig` fields; `_mlp` norm; `QNetwork`/agent wiring; weighted loss (P2).
+- [x] `src/rl/scoring_sac_agent.py` — `_encoder` norm (critic-only); agent wiring; weighted loss (P2).
+- [x] `src/rl/replay_buffer.py` — `save`/`load` (P3); prioritized buffers + sum-tree (P2).
+- [x] `src/train/config.py` — load new `sac:` keys (P1, P2).
+- [x] `src/train/hierarchical_train.py` — buffer persistence + resume wiring (P3).
+- [x] `train.py` — `--persist-buffer` flag (P3).
+- [x] `configs/dynamic.yaml` — enable UTD/LayerNorm (P1), PER (P2); comment the new keys.
+- [x] `tests/` — acceptance tests for P1, P2, P3 (`test_critic_layernorm.py`,
+      `test_per.py`, `test_buffer_persistence.py`).
+- [x] **Docs (final step):** `CLAUDE.md`, `docs/RL_AGENT_DESIGN.md` — reflect the
+      shipped behavior; "Status: implemented" line added above.
 
 ## References
 

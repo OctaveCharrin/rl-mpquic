@@ -216,8 +216,11 @@ def _rollout(
     tdec: List[float] = []          # path decision ms (every frame)
     actpaths: List[float] = []      # number of live paths per frame
     spent: List[float] = []         # split entropy (nats) per frame
-    # Per-window (App cadence).
+    # Per-window (App cadence). The full component tuple (vmaf/latency/jitter/loss)
+    # is retained aligned with the scored QoE so offline reward calibration
+    # (Phase 2.2) can correlate a linear-R-on-components against a QoE oracle.
     win_qoe, win_vmaf, app_dec = [], [], []
+    win_lat, win_jit, win_loss = [], [], []
 
     have_window = False
     done = env.is_done()
@@ -227,6 +230,9 @@ def _rollout(
                 r, comps = env.pop_app_window_reward()
                 win_qoe.append(r)
                 win_vmaf.append(comps["vmaf"])
+                win_lat.append(comps["latency_ms"])
+                win_jit.append(comps["jitter_ms"])
+                win_loss.append(comps["loss"])
             target, app_ms = _timed(bitrate_fn, obs)
             app_dec.append(app_ms)
             have_window = True
@@ -258,6 +264,9 @@ def _rollout(
         r, comps = env.pop_app_window_reward()
         win_qoe.append(r)
         win_vmaf.append(comps["vmaf"])
+        win_lat.append(comps["latency_ms"])
+        win_jit.append(comps["jitter_ms"])
+        win_loss.append(comps["loss"])
 
     los_arr = np.asarray(los, dtype=np.float64)
     return {
@@ -286,6 +295,15 @@ def _rollout(
             "path_decision_ms": tdec,
             "active_paths": actpaths,
             "split_entropy": spent,
+        },
+        # Per-App-window components aligned with the scored QoE (for Phase 2.2
+        # reward calibration: correlate a candidate linear R against an oracle).
+        "qoe_components": {
+            "qoe": win_qoe,
+            "vmaf": win_vmaf,
+            "latency_ms": win_lat,
+            "jitter_ms": win_jit,
+            "loss": win_loss,
         },
         "deadline_miss_rate": float(np.mean(los_arr >= 0.999)) if los_arr.size else 0.0,
     }
@@ -364,7 +382,10 @@ def run_evaluation(
 
     Returns the full results dict (also written to
     ``<out_dir>/evaluation_results.json`` when ``save_json``), with keys
-    ``meta`` / ``summary`` / ``distributions`` / ``traces``. Prints a table.
+    ``meta`` / ``summary`` / ``distributions`` / ``qoe_components`` / ``traces``.
+    ``qoe_components`` holds per-App-window ``(qoe, vmaf, latency_ms, jitter_ms,
+    loss)`` arrays per policy, aligned with the scored QoE (for reward
+    calibration). Prints a table.
 
     ``use_learned_vmaf`` (when not None) overrides ``cfg.use_learned_vmaf`` so
     QoE is scored with the learned QoS->VMAF surrogate, matching how you trained.
@@ -429,7 +450,9 @@ def run_evaluation(
     summary: Dict[str, Dict] = {}
     distributions: Dict[str, Dict] = {}
     traces: Dict[str, Dict] = {}
+    qoe_components: Dict[str, Dict] = {}  # per-window components for calibration
     flat: Dict[str, Dict[str, float]] = {}  # compact view for the printed table
+    _COMP_FIELDS = ("qoe", "vmaf", "latency_ms", "jitter_ms", "loss")
 
     try:
         # Warm up each policy (stabilizes torch first-call timing).
@@ -454,6 +477,14 @@ def run_evaluation(
                     agg[f].extend(r["dist"][f])
             distributions[name] = {f: [float(v) for v in agg[f]] for f in _DIST_FIELDS}
             traces[name] = rolls[0]["trace"]  # representative episode
+
+            comp_agg = {f: [] for f in _COMP_FIELDS}
+            for r in rolls:
+                for f in _COMP_FIELDS:
+                    comp_agg[f].extend(r["qoe_components"][f])
+            qoe_components[name] = {
+                f: [float(v) for v in comp_agg[f]] for f in _COMP_FIELDS
+            }
 
             summary[name] = {
                 "qoe": _stats(agg["qoe"]),
@@ -506,6 +537,7 @@ def run_evaluation(
         },
         "summary": summary,
         "distributions": distributions,
+        "qoe_components": qoe_components,
         "traces": traces,
     }
 

@@ -96,7 +96,14 @@ Ordered by expected return-on-effort for *this* codebase.
 
 ### Tier 1 — high impact, low effort
 
-1. **Raise the update-to-data ratio (UTD) with critic normalization.**
+**Status: Tier-1 #1, #2, #3 are implemented** (DroQ-style critic LayerNorm +
+higher UTD, Prioritized Experience Replay, and replay-buffer persistence across
+`--resume`). All are off by default and enabled in `configs/dynamic.yaml`; see
+`docs/PATCH_TIER1_SAMPLE_EFFICIENCY.md`.
+
+1. **Raise the update-to-data ratio (UTD) with critic normalization.** *(done —
+   `critic_layernorm` + `updates_per_step: 10` in `dynamic.yaml`; LayerNorm is
+   threaded into the critic `_mlp`/`_encoder` only, never the policy body.)*
    `updates_per_step = 1` under-exploits SAC's off-policy advantage precisely
    where samples are most expensive (NS-3). Increasing UTD to 4–20 extracts far
    more learning per frame, but naive high-UTD SAC diverges from Q-overestimation.
@@ -112,14 +119,19 @@ Ordered by expected return-on-effort for *this* codebase.
    `scoring_sac_agent.py:46`) and bump `updates_per_step`. This is the single
    biggest expected win.
 
-2. **Prioritized Experience Replay** (Schaul et al., 2016). The critical events
+2. **Prioritized Experience Replay** (Schaul et al., 2016). *(done — sum-tree
+   `PrioritizedReplayBuffer`/`PrioritizedStructuredReplayBuffer`, IS-weighted
+   critic loss, beta annealed `per_beta0`→1; enable with `prioritized: true`.)*
+   The critical events
    under `configs/dynamic.yaml` — churn-out, regime swaps, correlated failures —
    are *rare*, so uniform sampling from `ReplayBuffer`/`StructuredReplayBuffer`
    under-trains exactly the transitions that matter. TD-error prioritization
    upweights them. Drop-in change to `replay_buffer.py` (add a sum-tree and
    importance-sampling weights into the critic loss).
 
-3. **Persist the replay buffer across `--resume`.** The loop notes the buffer
+3. **Persist the replay buffer across `--resume`.** *(done — `--persist-buffer`
+   writes `app_buffer.npz`/`path_buffer.npz`; resume restores them and skips the
+   cold-start warm-up hack.)* The loop notes the buffer
    "restarts empty" on resume (`hierarchical_train.py:121`), discarding warm data
    and re-incurring a cold refill each chunk. Serializing the buffer alongside the
    checkpoints removes a real regression in chunked/interruptible runs.
