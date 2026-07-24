@@ -1,0 +1,18 @@
+# Role profile: INTERACTIVE (two-way talking-heads video call).
+# G.1010 class: conversational videophone — the most delay-sensitive.
+# This is the current default operating point. A fragment: deep-merged over a
+# base config via `profile: interactive` or `--profile interactive`.
+#
+# Weights below are the calibrated-vs-G.1070 values (see configs/calibrated.yaml);
+# recalibrate per profile with scripts/calibrate_reward.py against this profile's
+# fixed norms/deadline.
+
+deadline_ms: 180        # inside the G.114 150/400 ms interactivity band
+
+reward:
+  a_quality: 1.0
+  b_latency: 0.25
+  c_jitter: 0.25        # pinned = b (1:1 standards ratio)
+  d_loss: 2.0
+  latency_norm_ms: 200.0    # G.114 (2x soft cap -> 400 ms)
+  jitter_norm_ms: 50.0      # Y.1541 IPDV

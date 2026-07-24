@@ -35,7 +35,7 @@ import os
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -222,6 +222,62 @@ class DynamicsConfig:
     corr_rate: float = 0.05          # group events per second
     corr_intensity: float = 0.30     # capacity multiplier for all members
     corr_duration_s: float = 1.0
+
+    # Optional per-episode domain randomization of the continuous parameters
+    # above (None => fixed dynamics, legacy). Applied by the training loop, not by
+    # the dataplane itself, so a sampled DynamicsConfig carries randomize=None.
+    randomize: Optional["DynamicsRandomization"] = None
+
+
+@dataclass
+class DynamicsRandomization:
+    """Per-episode domain randomization of :class:`DynamicsConfig` (Tier-2 #7).
+
+    **Off by default.** When enabled, each configured ``(lo, hi)`` range is sampled
+    uniformly per episode (seeded per episode for determinism); the base
+    ``DynamicsConfig`` supplies the on/off flags, ``corr_groups``, and any parameter
+    left without a range here. Randomizing the dynamics *distribution* trains a
+    policy robust to a family of networks rather than one (Tobin et al., 2017).
+
+    **Mock-only:** the NS-3 backend receives dynamics at C++ process start, so it
+    keeps a single config; the training loop applies this only for ``backend=mock``.
+    """
+
+    enabled: bool = False
+    churn_up_rate: Optional[Tuple[float, float]] = None
+    churn_down_rate: Optional[Tuple[float, float]] = None
+    regime_rate: Optional[Tuple[float, float]] = None
+    regime_lo: Optional[Tuple[float, float]] = None
+    regime_hi: Optional[Tuple[float, float]] = None
+    burst_rate: Optional[Tuple[float, float]] = None
+    burst_intensity: Optional[Tuple[float, float]] = None
+    corr_rate: Optional[Tuple[float, float]] = None
+    corr_intensity: Optional[Tuple[float, float]] = None
+
+    def sample(self, base: "DynamicsConfig", rng: np.random.Generator) -> "DynamicsConfig":
+        """Return a copy of ``base`` with each configured range sampled uniformly."""
+        import dataclasses
+
+        def pick(rng_range, cur):
+            return float(rng.uniform(rng_range[0], rng_range[1])) if rng_range else cur
+
+        lo = pick(self.regime_lo, base.regime_lo)
+        hi = pick(self.regime_hi, base.regime_hi)
+        if lo > hi:  # keep the regime multiplier band ordered
+            lo, hi = hi, lo
+        return dataclasses.replace(
+            base,
+            randomize=None,
+            churn_up_rate=pick(self.churn_up_rate, base.churn_up_rate),
+            churn_down_rate=pick(self.churn_down_rate, base.churn_down_rate),
+            regime_rate=pick(self.regime_rate, base.regime_rate),
+            regime_lo=lo,
+            regime_hi=hi,
+            burst_rate=pick(self.burst_rate, base.burst_rate),
+            burst_intensity=pick(self.burst_intensity, base.burst_intensity),
+            corr_rate=pick(self.corr_rate, base.corr_rate),
+            corr_intensity=pick(self.corr_intensity, base.corr_intensity),
+        )
 
 
 @dataclass

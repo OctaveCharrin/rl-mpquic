@@ -34,12 +34,12 @@ from .config import ExperimentConfig
 
 def _build_path_agent(cfg: ExperimentConfig, env: HierarchicalRealtimeEnv) -> PathAgent:
     """Construct the Path agent for the configured architecture."""
-    if cfg.path_arch == "scoring":
+    if cfg.path_arch in ("scoring", "scoring_attn"):
         return PathAgent(
             env.path_obs_dim,
             env.num_paths,
             config=cfg.sac,
-            arch="scoring",
+            arch=cfg.path_arch,
             global_dim=env.path_global_dim,
             path_dim=env.path_feat_dim,
         )
@@ -48,7 +48,7 @@ def _build_path_agent(cfg: ExperimentConfig, env: HierarchicalRealtimeEnv) -> Pa
 
 def _path_obs(env: HierarchicalRealtimeEnv, obs, target_kbps: float, arch: str):
     """Build the path-agent observation matching the agent architecture."""
-    if arch == "scoring":
+    if arch in ("scoring", "scoring_attn"):  # both use the structured state
         return env.build_path_state(obs, target_kbps)
     return env.build_path_obs(obs, target_kbps)
 
@@ -151,9 +151,24 @@ def run_training(
             )
         print(f"resumed from checkpoints in {out_dir}", flush=True)
 
+    # Optional per-episode domain randomization of the mock dynamics (Tier-2 #7).
+    # Mock-only: the NS-3 backend gets dynamics at C++ start, so it keeps one config.
+    _dr = cfg.dynamics.randomize if cfg.dynamics else None
+    _do_dr = _dr is not None and _dr.enabled and backend == "mock"
+    _base_dynamics = cfg.dynamics
+    if _do_dr:
+        print("domain randomization: resampling mock dynamics per episode", flush=True)
+
     history: List[Dict[str, float]] = []
     try:
         for ep in range(episodes):
+            if _do_dr:
+                # Sample from the *original* base each episode; seed per episode so
+                # a given (seed, episode) is reproducible. reset() re-inits the
+                # dynamics state machines from this mutated config.
+                env.dp.config.dynamics = _dr.sample(
+                    _base_dynamics, np.random.default_rng(base_seed + ep)
+                )
             stats = _run_episode(env, app, path_agent, seed=base_seed + ep, episode=ep)
             history.append(stats)
             # Checkpoint after every episode so an interrupted run still leaves a

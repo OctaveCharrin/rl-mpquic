@@ -1,8 +1,11 @@
 # Implementation Roadmap
 
 Sequenced code plan tying together the reward, agent-architecture, and role-profile
-work. **Status at time of writing: all planning is documented; no code has
-changed yet** — every task below is code to do.
+work. **Status: Phases 0–1 done; Phase 2 (G.1070 calibration), Phase 3 (role
+profiles), and the executable parts of Phase 4 (4.1 domain randomization, 4.2
+PopArt, 4.4 attention pool) are implemented — all off by default / additive. 2.1
+(deadline softening) was skipped by decision; 4.3 (role-conditioned policy) and
+4.5 (recurrence/HIRO) remain sketched.**
 
 Companion docs (the "what" and "why"; this file is the "in what order"):
 - `docs/REWARD_TUNING.md` — reward coefficient justification, calibration

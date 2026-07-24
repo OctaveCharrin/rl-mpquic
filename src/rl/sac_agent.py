@@ -52,6 +52,12 @@ class SACConfig:
     per_alpha: float = 0.6        # priority exponent (0 = uniform)
     per_beta0: float = 0.4        # initial IS-correction exponent
     per_beta_steps: int = 100_000  # anneal beta 0->1 over this many updates
+    # PopArt return scaling (Tier-3 #9): normalize the critic's regression targets
+    # by a running mean/std, preserving outputs on stat shifts. Off => identity,
+    # byte-identical to plain SAC. Lets App (windowed) and Path (per-frame) reward
+    # magnitudes coexist without hand-balanced critic learning rates.
+    popart: bool = False
+    popart_beta: float = 1e-3     # EMA rate for the running target statistics
 
 
 def _mlp(
@@ -106,7 +112,15 @@ class GaussianPolicy(nn.Module):
 
 
 class QNetwork(nn.Module):
-    """Twin Q networks Q1, Q2 over (obs, action)."""
+    """Twin Q networks Q1, Q2 over (obs, action).
+
+    With ``popart=True`` the twins output in a **normalized** value space and a
+    shared running mean/std (``popart_mu``/``popart_nu``) maps to/from real values;
+    :meth:`update_popart` refreshes the stats and rescales both output layers to
+    preserve their outputs (PopArt, van Hasselt et al., 2016). With ``popart=False``
+    every PopArt method is the identity, so the network is byte-identical to plain
+    SAC.
+    """
 
     def __init__(
         self,
@@ -116,14 +130,52 @@ class QNetwork(nn.Module):
         *,
         layernorm: bool = False,
         dropout: float = 0.0,
+        popart: bool = False,
+        popart_beta: float = 1e-3,
     ):
         super().__init__()
         self.q1 = _mlp(obs_dim + act_dim, hidden, 1, layernorm=layernorm, dropout=dropout)
         self.q2 = _mlp(obs_dim + act_dim, hidden, 1, layernorm=layernorm, dropout=dropout)
+        self.popart = popart
+        if popart:
+            self.popart_beta = popart_beta
+            self.register_buffer("popart_mu", torch.zeros(1))
+            self.register_buffer("popart_nu", torch.ones(1))  # running second moment
 
     def forward(self, obs: torch.Tensor, act: torch.Tensor):
         x = torch.cat([obs, act], dim=-1)
         return self.q1(x), self.q2(x)
+
+    # -- PopArt (all identities when popart is off) ------------------------- #
+
+    def _sigma(self) -> torch.Tensor:
+        return (self.popart_nu - self.popart_mu.pow(2)).clamp(min=1e-4).sqrt()
+
+    def denormalize(self, y: torch.Tensor) -> torch.Tensor:
+        if not self.popart:
+            return y
+        return self._sigma() * y + self.popart_mu
+
+    def normalize(self, y: torch.Tensor) -> torch.Tensor:
+        if not self.popart:
+            return y
+        return (y - self.popart_mu) / self._sigma()
+
+    @torch.no_grad()
+    def update_popart(self, targets: torch.Tensor) -> None:
+        """EMA-update the running stats and rescale output layers to preserve outputs."""
+        if not self.popart:
+            return
+        old_mu = self.popart_mu.clone()
+        old_sigma = self._sigma().clone()
+        b = self.popart_beta
+        self.popart_mu.mul_(1.0 - b).add_(b * targets.mean())
+        self.popart_nu.mul_(1.0 - b).add_(b * targets.pow(2).mean())
+        new_sigma = self._sigma()
+        scale = old_sigma / new_sigma
+        for head in (self.q1[-1], self.q2[-1]):  # final Linear of each twin
+            head.weight.mul_(scale)
+            head.bias.copy_((old_sigma * head.bias + old_mu - self.popart_mu) / new_sigma)
 
 
 class SACAgent:
@@ -139,7 +191,8 @@ class SACAgent:
 
         self.policy = GaussianPolicy(obs_dim, act_dim, self.cfg.hidden_dim).to(self.device)
         q_kwargs = dict(
-            layernorm=self.cfg.critic_layernorm, dropout=self.cfg.critic_dropout
+            layernorm=self.cfg.critic_layernorm, dropout=self.cfg.critic_dropout,
+            popart=self.cfg.popart, popart_beta=self.cfg.popart_beta,
         )
         self.critic = QNetwork(obs_dim, act_dim, self.cfg.hidden_dim, **q_kwargs).to(self.device)
         self.critic_target = QNetwork(
@@ -235,11 +288,17 @@ class SACAgent:
         done = torch.as_tensor(done, device=self.device)
 
         # --- critic ---
+        # PopArt: target-net outputs are denormalized to real values (identity when
+        # off), the running stats are refreshed from the real TD target, and the
+        # target is re-normalized for the (normalized-space) critic regression.
         with torch.no_grad():
             next_act, next_logp, _ = self.policy.sample(next_obs)
             q1_t, q2_t = self.critic_target(next_obs, next_act)
+            q1_t, q2_t = self.critic.denormalize(q1_t), self.critic.denormalize(q2_t)
             q_t = torch.min(q1_t, q2_t) - self.alpha * next_logp
-            target = rew + self.cfg.gamma * (1.0 - done) * q_t
+            target_raw = rew + self.cfg.gamma * (1.0 - done) * q_t
+            self.critic.update_popart(target_raw)
+            target = self.critic.normalize(target_raw)
 
         q1, q2 = self.critic(obs, act)
         if self.cfg.prioritized:
@@ -259,6 +318,7 @@ class SACAgent:
         # --- actor ---
         new_act, logp, _ = self.policy.sample(obs)
         q1_pi, q2_pi = self.critic(obs, new_act)
+        q1_pi, q2_pi = self.critic.denormalize(q1_pi), self.critic.denormalize(q2_pi)
         q_pi = torch.min(q1_pi, q2_pi)
         policy_loss = (self.alpha.detach() * logp - q_pi).mean()
         self.policy_opt.zero_grad()

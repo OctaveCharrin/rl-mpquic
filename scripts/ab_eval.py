@@ -224,6 +224,8 @@ def _print_compare(label_a: str, agg_a: Dict, label_b: str, agg_b: Dict) -> None
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", default="configs/dynamic.yaml", help="YAML config path")
+    p.add_argument("--profile", default=None,
+                   help="role profile (interactive|presenter|passive); overrides config")
     p.add_argument("--backend", choices=["mock", "ns3"], default="mock")
     p.add_argument("--app", required=True, help="App checkpoint (set A)")
     p.add_argument("--path", required=True, help="Path checkpoint (set A)")
@@ -241,7 +243,7 @@ def main() -> None:
     if (args.app_b is None) != (args.path_b is None):
         p.error("--app-b and --path-b must be given together (compare mode)")
 
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, profile=args.profile)
     out_dir = args.out or os.path.join("runs", "ab-" + time.strftime("%Y%m%d-%H%M%S"))
     os.makedirs(out_dir, exist_ok=True)
     ulv = args.learned_vmaf or None

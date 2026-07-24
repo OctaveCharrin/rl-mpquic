@@ -28,6 +28,18 @@ side is the "brain"; the C++ NS-3 scenario is a thin "body".
   `PathState` (`build_path_state`, `glob`/`paths`/`mask`) for scoring.
 - `src/ns3env/qoe.py`, `video_source.py` — reward math and the frame-size model
   (the latter mirrors `RealtimeController::GenerateFrame` in C++).
+- `src/ns3env/g1070.py` — ITU-T G.1070 opinion-model **oracle** (video quality
+  `Vq(bitrate,loss)` + multimedia-integration delay term) used only to *calibrate*
+  the reward, not in the reward path. `scripts/calibrate_reward.py` fits `(b,d)`
+  (with `c` pinned = `b`) by correlating the linear reward vs G.1070 MOS over a
+  corpus; results land in `configs/calibrated.yaml` (`default.yaml` keeps the
+  provisional weights). G.1070 has no jitter axis — a dormant surrogate-jitter
+  composite auto-activates only if `reward_model.npz` is refit. See
+  `docs/REWARD_TUNING.md` §5B.
+- **Role/use-case profiles** (`docs/REWARD_TUNING.md` §7): `configs/profiles/{interactive,
+  presenter,passive}.yaml` bundle reward weights + `deadline_ms`, selected by a
+  `profile:` YAML key or `--profile` (deep-merged, profile wins). Absent =>
+  legacy. `deadline_ms` is now YAML-readable (was a code-global).
 - `src/rl/` — generic flat `SACAgent` and permutation-equivariant
   `ScoringSACAgent` (both in normalized `[-1,1]` action space), plus the
   `AppAgent` / `PathAgent` wrappers that map to bitrate / split. The Path
@@ -38,6 +50,11 @@ side is the "brain"; the C++ NS-3 scenario is a thin "body".
   body) and **Prioritized Experience Replay** (`prioritized: true`, sum-tree
   buffers in `replay_buffer.py`, IS-weighted critic loss, beta annealed via
   `per_beta0`/`per_beta_steps`). Replay buffers persist across `--resume` (P3).
+  Two more off-by-default knobs: **PopArt** return scaling (`popart: true`;
+  running-stat critic-target normalization with output preservation, in both
+  `QNetwork`/`ScoringQNetwork` — identity when off) and a **Set-Transformer
+  attention-pool** scoring critic (`path_arch: scoring_attn`, `ScoringAttnSACAgent`;
+  masked self-attention across paths before the mean pool, targeting `corr_groups`).
 - `src/train/` — config loader, the dual-cadence training loop, evaluation+baselines.
 - `train.py` / `evaluate.py` — thin CLIs only.
 
@@ -62,7 +79,10 @@ the full system; on the dynamic scenario the same App-only ablation *collapses*)
   variable active count; bytes onto a dead path = loss), **regime shifts**
   (abrupt best-path swaps), **congestion bursts**, **correlated failures**.
   `FrameObs.path_active` is the liveness mask. Deterministic per seed; static
-  behavior is byte-identical when disabled.
+  behavior is byte-identical when disabled. Optional per-episode **domain
+  randomization** (`DynamicsRandomization`, `dynamics.randomize:` block) resamples
+  the hazard rates/intensities each episode (mock-only, seeded, off by default;
+  `configs/dynamic_dr.yaml`).
 - **Scoring Path agent** (`path_arch: scoring`): consumes the structured
   `(glob, paths, mask)` state, shared per-path actor + masked-softmax split,
   DeepSets masked-mean critic — handles a variable/changing path set. `"flat"`

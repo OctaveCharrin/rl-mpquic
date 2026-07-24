@@ -1,0 +1,18 @@
+# Role profile: PRESENTER (screen-share / slides -> attendees who can buffer).
+# G.1010 class: one-way video. Delay budget widens, delay/jitter downweighted;
+# but slide/text content is near-zero loss tolerance, so loss stays dominant.
+# Fragment: `profile: presenter` or `--profile presenter`.
+#
+# Provisional values from docs/REWARD_TUNING.md §7 (delay relaxed vs interactive).
+# Recalibrate `b`/`d` with scripts/calibrate_reward.py at these norms/deadline:
+#   --latency-norm 400 --jitter-norm 100
+
+deadline_ms: 400        # attendees can buffer -> wider one-way budget
+
+reward:
+  a_quality: 1.0
+  b_latency: 0.2        # delay downweighted (one-way, buffered)
+  c_jitter: 0.2
+  d_loss: 2.0           # dropped slide region is unreadable -> loss dominant
+  latency_norm_ms: 400.0    # 2x soft cap -> 800 ms
+  jitter_norm_ms: 100.0

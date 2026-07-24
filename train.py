@@ -18,6 +18,8 @@ from src.train.hierarchical_train import run_training
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", default="configs/default.yaml", help="YAML config path")
+    p.add_argument("--profile", default=None,
+                   help="role profile (interactive|presenter|passive); overrides config")
     p.add_argument("--backend", choices=["mock", "ns3"], default="mock")
     p.add_argument("--episodes", type=int, default=None, help="override config episodes")
     p.add_argument("--seed", type=int, default=None, help="override base seed")
@@ -50,7 +52,7 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, profile=args.profile)
     if args.ns3_transport:
         cfg.transport = args.ns3_transport
     run_training(

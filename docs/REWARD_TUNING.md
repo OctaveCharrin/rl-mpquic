@@ -204,6 +204,14 @@ Pensieve/RTC rationale). Adopt `b = c = 0.5` as the working default, documented
 as **provisional pending the §5B calibration**. Treat §5D as the roadmap item
 that makes the weights defensible rather than merely reasonable.
 
+**Implemented (Phase 2).** The §5B calibration is now code: `src/ns3env/g1070.py`
+(the G.1070 MOS oracle) + `scripts/calibrate_reward.py` (grid-fit `(b,d)` with
+`c` pinned = `b`, since neither G.1070 nor the shipped surrogate resolves jitter).
+`configs/default.yaml` keeps the provisional weights; `configs/calibrated.yaml`
+carries the G.1070-fit result (loss weighted up, delay down — G.1070's loss
+robustness is steep and its delay term weak). Regenerate against real traces with
+`--runs <ab_eval_out>`.
+
 ## 7. Role / use-case coefficient profiles
 
 The coefficients above describe *one* operating point. But a video-conferencing

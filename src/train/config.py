@@ -9,6 +9,7 @@ baselines (rate -> base Mbps, delay -> base RTT, cross_frac -> mean cross-traffi
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -18,6 +19,7 @@ import yaml
 from ..ns3env.dataplane import (
     DataPlane,
     DynamicsConfig,
+    DynamicsRandomization,
     MockRealtimeConfig,
     MockRealtimeDataPlane,
     Ns3Config,
@@ -150,8 +152,14 @@ class ExperimentConfig:
         raise ValueError(f"unknown backend {backend!r} (use 'mock' or 'ns3')")
 
 
-def load_config(path: Optional[str] = None) -> ExperimentConfig:
-    """Load an ExperimentConfig from YAML (defaults if ``path`` is None)."""
+def load_config(
+    path: Optional[str] = None, *, profile: Optional[str] = None
+) -> ExperimentConfig:
+    """Load an ExperimentConfig from YAML (defaults if ``path`` is None).
+
+    ``profile`` (or an in-file ``profile:`` key) selects a role/use-case bundle;
+    the explicit ``profile`` argument (e.g. from ``--profile``) wins over the key.
+    """
     cfg = ExperimentConfig()
     if path is None:
         cfg.paths = _DEFAULT_PATHS()
@@ -159,6 +167,14 @@ def load_config(path: Optional[str] = None) -> ExperimentConfig:
 
     with open(path, "r") as fh:
         data = yaml.safe_load(fh) or {}
+
+    # Optional role/use-case profile (docs/REWARD_TUNING.md §7). A profile names a
+    # fragment under `configs/profiles/` carrying reward weights + `deadline_ms`;
+    # it is deep-merged so the profile *wins* for the keys it sets (the base config
+    # supplies topology/video/sac/run). Absent => legacy path.
+    profile_name = profile or data.get("profile")
+    if profile_name:
+        data = _deep_merge(data, _load_profile(profile_name, base_config_path=path))
 
     topo = data.get("topology", {})
     cfg.paths = topo.get("paths", _DEFAULT_PATHS())
@@ -184,6 +200,10 @@ def load_config(path: Optional[str] = None) -> ExperimentConfig:
     cfg.episode_seconds = float(ep.get("seconds", 30.0))
     cfg.app_period_s = float(ep.get("app_period_s", 1.0))
     cfg.warmup_s = float(ep.get("warmup_s", 1.0))
+    # `deadline_ms` is the most role-sensitive knob (a profile bundles it with the
+    # reward weights). Accepted top-level (profile convention) or under `episode:`;
+    # defaults to the code-side 180 ms so legacy configs are unchanged.
+    cfg.deadline_ms = float(data.get("deadline_ms", ep.get("deadline_ms", cfg.deadline_ms)))
 
     sac = data.get("sac", {})
     cfg.sac = SACConfig(
@@ -203,6 +223,8 @@ def load_config(path: Optional[str] = None) -> ExperimentConfig:
         per_alpha=float(sac.get("per_alpha", 0.6)),
         per_beta0=float(sac.get("per_beta0", 0.4)),
         per_beta_steps=int(sac.get("per_beta_steps", 100_000)),
+        popart=bool(sac.get("popart", False)),
+        popart_beta=float(sac.get("popart_beta", 1e-3)),
     )
 
     run = data.get("run", {})
@@ -215,6 +237,35 @@ def load_config(path: Optional[str] = None) -> ExperimentConfig:
 
     cfg.dynamics = _parse_dynamics(data.get("dynamics"))
     return cfg
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively overlay ``override`` onto ``base`` (override wins; dicts merge)."""
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _load_profile(name: str, *, base_config_path: str) -> Dict[str, Any]:
+    """Resolve and load a role profile fragment.
+
+    ``name`` is a preset name (resolved to ``<config_dir>/profiles/<name>.yaml``)
+    or an explicit path ending in ``.yaml``. The `profile:` key itself is stripped
+    so it does not recurse.
+    """
+    if name.endswith(".yaml") or os.path.sep in name:
+        prof_path = name
+    else:
+        config_dir = os.path.dirname(os.path.abspath(base_config_path))
+        prof_path = os.path.join(config_dir, "profiles", f"{name}.yaml")
+    with open(prof_path, "r") as fh:
+        prof = yaml.safe_load(fh) or {}
+    prof.pop("profile", None)
+    return prof
 
 
 def _parse_dynamics(d: Optional[Dict[str, Any]]) -> Optional[DynamicsConfig]:
@@ -244,6 +295,34 @@ def _parse_dynamics(d: Optional[Dict[str, Any]]) -> Optional[DynamicsConfig]:
         corr_rate=float(d.get("corr_rate", 0.05)),
         corr_intensity=float(d.get("corr_intensity", 0.30)),
         corr_duration_s=float(d.get("corr_duration_s", 1.0)),
+        randomize=_parse_dynamics_randomization(d.get("randomize")),
+    )
+
+
+def _parse_dynamics_randomization(r: Optional[Dict[str, Any]]) -> Optional[DynamicsRandomization]:
+    """Build a :class:`DynamicsRandomization` from the ``dynamics.randomize:`` block.
+
+    Returns None when absent or ``enabled: false`` (fixed dynamics). Each key is an
+    optional ``[lo, hi]`` pair; keys left out are not randomized.
+    """
+    if not r or not bool(r.get("enabled", False)):
+        return None
+
+    def rng(key):
+        v = r.get(key)
+        return (float(v[0]), float(v[1])) if v else None
+
+    return DynamicsRandomization(
+        enabled=True,
+        churn_up_rate=rng("churn_up_rate"),
+        churn_down_rate=rng("churn_down_rate"),
+        regime_rate=rng("regime_rate"),
+        regime_lo=rng("regime_lo"),
+        regime_hi=rng("regime_hi"),
+        burst_rate=rng("burst_rate"),
+        burst_intensity=rng("burst_intensity"),
+        corr_rate=rng("corr_rate"),
+        corr_intensity=rng("corr_intensity"),
     )
 
 

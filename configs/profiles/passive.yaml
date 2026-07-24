@@ -1,0 +1,18 @@
+# Role profile: PASSIVE (low-priority secondary camera / view-only thumbnail).
+# G.1010 class: background / streaming. Delay nearly irrelevant; continuity
+# matters more than instantaneous latency; the stream is low-value, so even loss
+# is relaxed to yield path/rate budget to higher-value flows.
+# Fragment: `profile: passive` or `--profile passive`.
+#
+# Provisional values from docs/REWARD_TUNING.md §7. Recalibrate at:
+#   --latency-norm 800 --jitter-norm 150
+
+deadline_ms: 800        # delay nearly irrelevant
+
+reward:
+  a_quality: 1.0
+  b_latency: 0.1        # delay almost ignored
+  c_jitter: 0.3         # continuity/smoothness kept modest
+  d_loss: 0.7           # low-priority stream yields budget under loss
+  latency_norm_ms: 800.0    # 2x soft cap -> 1600 ms
+  jitter_norm_ms: 150.0

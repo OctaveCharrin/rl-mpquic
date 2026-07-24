@@ -325,9 +325,9 @@ def _learned_policies(env, app_path, path_ckpt, cfg):
     # state dict with "arch"); a legacy flat checkpoint has no such key.
     p_sd = torch.load(path_ckpt, map_location="cpu")
     arch = p_sd.get("arch", "flat") if isinstance(p_sd, dict) else "flat"
-    if arch == "scoring":
+    if arch in ("scoring", "scoring_attn"):
         path_agent = PathAgent(
-            env.path_obs_dim, env.num_paths, config=cfg.sac, arch="scoring",
+            env.path_obs_dim, env.num_paths, config=cfg.sac, arch=arch,
             global_dim=env.path_global_dim, path_dim=env.path_feat_dim,
         )
     else:
@@ -341,7 +341,7 @@ def _learned_policies(env, app_path, path_ckpt, cfg):
     def split_fn(obs: FrameObs, target: float) -> np.ndarray:
         p_obs = (
             env.build_path_state(obs, target)
-            if arch == "scoring"
+            if arch in ("scoring", "scoring_attn")
             else env.build_path_obs(obs, target)
         )
         split, _ = path_agent.select(p_obs, deterministic=True)

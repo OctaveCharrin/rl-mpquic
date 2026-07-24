@@ -146,8 +146,12 @@ higher UTD, Prioritized Experience Replay, and replay-buffer persistence across
    regime rather than react blindly. Start with cheap frame-stacking before
    recurrence.
 
-5. **Attention pooling in the scoring critic.** The DeepSets **masked-mean** pool
-   (`scoring_sac_agent.py:104`) is permutation-invariant but cannot represent
+5. **Attention pooling in the scoring critic.** *(done — `arch: scoring_attn`,
+   `ScoringAttnSACAgent`. A masked Set-Attention Block (`_MaskedSAB`) applies
+   multi-head self-attention across paths before the unchanged masked-mean pool, so
+   the critic can model inter-path structure; `pool="mean"` stays byte-identical.)*
+   The DeepSets **masked-mean** pool
+   (`scoring_sac_agent.py`) is permutation-invariant but cannot represent
    *interactions* between paths — yet `corr_groups` (shared-bottleneck correlated
    failures) are exactly inter-path structure. A **Set Transformer** (Lee et al.,
    2019) self-attention pool captures "these two paths fail together," directly
@@ -160,17 +164,24 @@ higher UTD, Prioritized Experience Replay, and replay-buffer persistence across
    non-stationary HRL credit assignment. Relevant because the App reward is a
    Monte-Carlo window sum with no within-window bootstrap.
 
-7. **Domain randomization over `DynamicsConfig` during training.** The dynamics
+7. **Domain randomization over `DynamicsConfig` during training.** *(done —
+   `DynamicsRandomization`, wired via the `dynamics.randomize:` YAML block, off by
+   default. The training loop resamples the dynamics hazard rates/intensities per
+   episode, seeded per episode for determinism; mock-only. See
+   `configs/dynamic_dr.yaml`.)* The dynamics
    parameters (churn/regime/burst rates) are fixed per config; randomizing them
    per episode (Tobin et al., 2017) trains a policy robust to a *distribution* of
    networks rather than one, improving generalization to unseen NS-3 conditions.
-   The machinery already exists — just sample the config fields per `reset`.
 
 ### Tier 3 — research-grade / exploratory
 
 8. **N-step returns for the fast Path agent** to accelerate credit assignment
    over the per-frame horizon (with the usual off-policy caveats).
-9. **Reward/return scaling (PopArt)** so the App (windowed) and Path (per-frame)
+9. **Reward/return scaling (PopArt)** *(done — `SACConfig.popart` (+ `popart_beta`),
+   off by default. Both `QNetwork` and `ScoringQNetwork` normalize critic targets by
+   a running mean/std and rescale their output layers to preserve outputs on stat
+   shifts (van Hasselt et al., 2016); every PopArt method is the identity when off,
+   so plain SAC is byte-identical.)* So the App (windowed) and Path (per-frame)
    magnitudes don't need hand-balanced learning rates.
 10. **Distributional critics** (QR-DQN/IQN-style) to better model the heavy-tailed
     latency under bursts.

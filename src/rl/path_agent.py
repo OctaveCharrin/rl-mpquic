@@ -21,7 +21,10 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 
 from .sac_agent import SACAgent, SACConfig
-from .scoring_sac_agent import ScoringSACAgent
+from .scoring_sac_agent import ScoringAttnSACAgent, ScoringSACAgent
+
+# Path-agent architectures that use the structured (glob, paths, mask) state.
+_SCORING_ARCHS = {"scoring": ScoringSACAgent, "scoring_attn": ScoringAttnSACAgent}
 
 _NEG_FILL = -1e30
 
@@ -43,16 +46,19 @@ class PathAgent:
         self.num_paths = int(num_paths)
         self.temperature = float(temperature)
         self.arch = str(arch)
-        if self.arch == "scoring":
+        if self.arch in _SCORING_ARCHS:
             if global_dim is None or path_dim is None:
-                raise ValueError("scoring arch requires global_dim and path_dim")
-            self.sac = ScoringSACAgent(
+                raise ValueError(f"{self.arch} arch requires global_dim and path_dim")
+            self.sac = _SCORING_ARCHS[self.arch](
                 int(global_dim), int(path_dim), self.num_paths, config=config
             )
         elif self.arch == "flat":
             self.sac = SACAgent(obs_dim, act_dim=self.num_paths, config=config)
         else:
-            raise ValueError(f"unknown path-agent arch {arch!r} (use 'flat' or 'scoring')")
+            raise ValueError(
+                f"unknown path-agent arch {arch!r} "
+                f"(use 'flat', 'scoring', or 'scoring_attn')"
+            )
 
     # -- split mapping ------------------------------------------------------ #
 
@@ -79,7 +85,7 @@ class PathAgent:
     def select(self, obs, deterministic: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """Return (split, raw_action). ``obs`` is a flat vector (flat arch) or a
         ``PathState`` (scoring arch)."""
-        if self.arch == "scoring":
+        if self.arch in _SCORING_ARCHS:
             raw = self.sac.select_action(
                 obs.glob, obs.paths, obs.mask, deterministic=deterministic
             )

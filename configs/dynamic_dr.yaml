@@ -1,0 +1,88 @@
+# configs/dynamic.yaml + per-episode DOMAIN RANDOMIZATION of the mock dynamics
+# (Phase 4.1 / RL_AGENT_DESIGN Tier-2 #7). Identical to dynamic.yaml except the
+# added `dynamics.randomize:` block: instead of one fixed dynamics setting, each
+# episode samples the listed hazard rates / intensities uniformly from their
+# ranges (seeded per episode for determinism), training a policy robust to a
+# *family* of networks. Mock-only. Absent the randomize block -> byte-identical
+# to dynamic.yaml.
+
+topology:
+  paths:
+    - {rate: "3Mbps",   delay: "10ms", cross_frac: 0.40}
+    - {rate: "2.5Mbps", delay: "15ms", cross_frac: 0.45}
+    - {rate: "2.5Mbps", delay: "40ms", cross_frac: 0.30}
+    - {rate: "2Mbps",   delay: "20ms", cross_frac: 0.55}
+    - {rate: "3Mbps",   delay: "25ms", cross_frac: 0.50}
+    - {rate: "2.5Mbps", delay: "30ms", cross_frac: 0.50}
+
+video:
+  fps: 30
+  min_bitrate_kbps: 300
+  max_bitrate_kbps: 6000
+  init_bitrate_kbps: 1500
+  frame_size_jitter: 0.25
+  keyframe_interval: 30
+
+episode:
+  seconds: 30
+  app_period_s: 1.0
+  warmup_s: 1.0
+
+reward:
+  a_quality: 1.0
+  b_latency: 0.5
+  c_jitter: 0.5
+  d_loss: 1.0
+  latency_norm_ms: 200.0
+  jitter_norm_ms: 50.0
+  e_util: 0.25
+  util_norm_kbps: 3300.0
+
+dynamics:
+  enabled: true
+  churn: true
+  churn_up_rate: 0.30
+  churn_down_rate: 0.08
+  min_active: 3
+  regime: true
+  regime_rate: 0.20
+  regime_lo: 0.55
+  regime_hi: 1.25
+  burst: true
+  burst_rate: 0.10
+  burst_intensity: 0.45
+  burst_duration_s: 0.5
+  corr_groups: [[4, 5]]
+  corr_rate: 0.05
+  corr_intensity: 0.50
+  corr_duration_s: 1.2
+  # ---- per-episode domain randomization (each key: [lo, hi], sampled uniformly)
+  randomize:
+    enabled: true
+    churn_down_rate: [0.05, 0.15]
+    regime_rate: [0.10, 0.35]
+    regime_lo: [0.45, 0.65]
+    burst_rate: [0.05, 0.20]
+    burst_intensity: [0.30, 0.55]
+    corr_intensity: [0.35, 0.60]
+
+sac:
+  hidden_dim: 256
+  gamma: 0.99
+  tau: 0.005
+  lr: 0.0003
+  batch_size: 256
+  buffer_size: 200000
+  start_steps: 1000
+  update_after: 1000
+  updates_per_step: 10
+  critic_layernorm: true
+  prioritized: true
+  auto_entropy: true
+
+run:
+  episodes: 200
+  seed: 1
+  cap_mbps: 20.0
+  out_dir: "runs"
+  path_arch: scoring

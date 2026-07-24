@@ -62,6 +62,30 @@ def _encoder(
     return nn.Sequential(*layers)
 
 
+class _MaskedSAB(nn.Module):
+    """Set Transformer Set-Attention Block: masked multi-head self-attention + residual.
+
+    Lets each path attend to every other *active* path, so the pooled critic
+    embedding can represent inter-path structure (e.g. shared-bottleneck
+    ``corr_groups`` that fail together) — which the plain masked-mean pool, being a
+    per-path average, is blind to (Lee et al., "Set Transformer", 2019). Uses no
+    positional encoding, so permutation-equivariance (hence the invariant pool) is
+    preserved. Requires >=1 active path per row (guaranteed by ``min_active``).
+    """
+
+    def __init__(self, hidden: int, n_heads: int = 4):
+        super().__init__()
+        heads = n_heads if hidden % n_heads == 0 else 1
+        self.attn = nn.MultiheadAttention(hidden, heads, batch_first=True)
+
+    def forward(self, emb: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        key_padding_mask = mask < 0.5  # True => key ignored
+        out, _ = self.attn(
+            emb, emb, emb, key_padding_mask=key_padding_mask, need_weights=False
+        )
+        return emb + out  # residual SAB
+
+
 class ScoringGaussianPolicy(nn.Module):
     """Shared per-path tanh-Gaussian policy over a variable path set."""
 
@@ -108,6 +132,10 @@ class ScoringQNetwork(nn.Module):
         *,
         layernorm: bool = False,
         dropout: float = 0.0,
+        popart: bool = False,
+        popart_beta: float = 1e-3,
+        pool: str = "mean",
+        attn_heads: int = 4,
     ):
         super().__init__()
         in_dim = global_dim + path_dim + 1  # + per-path action latent
@@ -116,9 +144,24 @@ class ScoringQNetwork(nn.Module):
         self.head1 = nn.Linear(hidden, 1)
         self.enc2 = _encoder(in_dim, hidden, **enc_kw)
         self.head2 = nn.Linear(hidden, 1)
+        # "mean" => plain masked-mean (byte-identical); "attn" => a Set-Attention
+        # Block transforms the per-path embeddings before the same masked-mean pool.
+        self.pool = pool
+        if pool == "attn":
+            self.attn1 = _MaskedSAB(hidden, attn_heads)
+            self.attn2 = _MaskedSAB(hidden, attn_heads)
+        else:
+            self.attn1 = self.attn2 = None
+        self.popart = popart
+        if popart:
+            self.popart_beta = popart_beta
+            self.register_buffer("popart_mu", torch.zeros(1))
+            self.register_buffer("popart_nu", torch.ones(1))
 
-    def _q(self, enc, head, x, mask):
+    def _q(self, enc, attn, head, x, mask):
         emb = enc(x)  # (B, N, H)
+        if attn is not None:  # inter-path self-attention before pooling
+            emb = attn(emb, mask)
         m = mask.unsqueeze(-1)
         pooled = (emb * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)  # masked mean
         return head(pooled)
@@ -133,15 +176,46 @@ class ScoringQNetwork(nn.Module):
         b, n, _ = paths.shape
         g = glob.unsqueeze(1).expand(b, n, glob.shape[-1])
         x = torch.cat([g, paths, act.unsqueeze(-1)], dim=-1)
-        return self._q(self.enc1, self.head1, x, mask), self._q(
-            self.enc2, self.head2, x, mask
+        return self._q(self.enc1, self.attn1, self.head1, x, mask), self._q(
+            self.enc2, self.attn2, self.head2, x, mask
         )
+
+    # -- PopArt (all identities when popart is off) ------------------------- #
+
+    def _sigma(self) -> torch.Tensor:
+        return (self.popart_nu - self.popart_mu.pow(2)).clamp(min=1e-4).sqrt()
+
+    def denormalize(self, y: torch.Tensor) -> torch.Tensor:
+        if not self.popart:
+            return y
+        return self._sigma() * y + self.popart_mu
+
+    def normalize(self, y: torch.Tensor) -> torch.Tensor:
+        if not self.popart:
+            return y
+        return (y - self.popart_mu) / self._sigma()
+
+    @torch.no_grad()
+    def update_popart(self, targets: torch.Tensor) -> None:
+        if not self.popart:
+            return
+        old_mu = self.popart_mu.clone()
+        old_sigma = self._sigma().clone()
+        b = self.popart_beta
+        self.popart_mu.mul_(1.0 - b).add_(b * targets.mean())
+        self.popart_nu.mul_(1.0 - b).add_(b * targets.pow(2).mean())
+        new_sigma = self._sigma()
+        scale = old_sigma / new_sigma
+        for head in (self.head1, self.head2):
+            head.weight.mul_(scale)
+            head.bias.copy_((old_sigma * head.bias + old_mu - self.popart_mu) / new_sigma)
 
 
 class ScoringSACAgent:
     """SAC over a structured, variable-path-count action space (per-path split)."""
 
     arch = "scoring"
+    pool = "mean"  # subclasses may override (see ScoringAttnSACAgent)
 
     def __init__(
         self,
@@ -160,7 +234,11 @@ class ScoringSACAgent:
 
         h = self.cfg.hidden_dim
         # LayerNorm/dropout go to the critic only, never the shared policy body.
-        q_kw = dict(layernorm=self.cfg.critic_layernorm, dropout=self.cfg.critic_dropout)
+        q_kw = dict(
+            layernorm=self.cfg.critic_layernorm, dropout=self.cfg.critic_dropout,
+            popart=self.cfg.popart, popart_beta=self.cfg.popart_beta,
+            pool=self.pool,
+        )
         self.policy = ScoringGaussianPolicy(global_dim, path_dim, h).to(self.device)
         self.critic = ScoringQNetwork(global_dim, path_dim, h, **q_kw).to(self.device)
         self.critic_target = ScoringQNetwork(global_dim, path_dim, h, **q_kw).to(self.device)
@@ -252,11 +330,16 @@ class ScoringSACAgent:
         n_glob, n_paths, n_mask = t("next_glob"), t("next_paths"), t("next_mask")
 
         # --- critic ---
+        # PopArt (identity when off): denormalize target-net outputs, refresh the
+        # running stats from the real TD target, re-normalize for the regression.
         with torch.no_grad():
             next_act, next_logp, _ = self.policy.sample(n_glob, n_paths, n_mask)
             q1_t, q2_t = self.critic_target(n_glob, n_paths, n_mask, next_act)
+            q1_t, q2_t = self.critic.denormalize(q1_t), self.critic.denormalize(q2_t)
             q_t = torch.min(q1_t, q2_t) - self.alpha * next_logp
-            target = rew + self.cfg.gamma * (1.0 - done) * q_t
+            target_raw = rew + self.cfg.gamma * (1.0 - done) * q_t
+            self.critic.update_popart(target_raw)
+            target = self.critic.normalize(target_raw)
 
         q1, q2 = self.critic(glob, paths, mask, act)
         if self.cfg.prioritized:
@@ -276,6 +359,7 @@ class ScoringSACAgent:
         # --- actor ---
         new_act, logp, _ = self.policy.sample(glob, paths, mask)
         q1_pi, q2_pi = self.critic(glob, paths, mask, new_act)
+        q1_pi, q2_pi = self.critic.denormalize(q1_pi), self.critic.denormalize(q2_pi)
         q_pi = torch.min(q1_pi, q2_pi)
         policy_loss = (self.alpha.detach() * logp - q_pi).mean()
         self.policy_opt.zero_grad()
@@ -339,3 +423,17 @@ class ScoringSACAgent:
         ``per_beta0`` — i.e. a fully faithful resume.
         """
         self._stores, self._updates = self.buffer.load(path)
+
+
+class ScoringAttnSACAgent(ScoringSACAgent):
+    """Scoring SAC whose critic pools paths with a Set-Attention Block (Tier-2 #5).
+
+    Identical to :class:`ScoringSACAgent` except the twin critics apply masked
+    multi-head self-attention across paths before the masked-mean pool, so they can
+    model inter-path structure (shared-bottleneck ``corr_groups``). Self-describing
+    ``arch = "scoring_attn"`` tag routes eval/resume; existing ``scoring``/``flat``
+    checkpoints are unaffected.
+    """
+
+    arch = "scoring_attn"
+    pool = "attn"

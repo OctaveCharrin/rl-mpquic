@@ -1,0 +1,63 @@
+# Calibrated variant of configs/default.yaml.
+#
+# Identical to default.yaml EXCEPT the `reward:` weights, which are calibrated
+# against the ITU-T G.1070 opinion model (docs/T-REC-G.1070-201806.pdf) via
+# `scripts/calibrate_reward.py` (see docs/REWARD_TUNING.md §5B). This file is
+# additive: default.yaml keeps the provisional b=c=0.5, d=1.0 so the old reward
+# stays runnable for A/B comparison.
+#
+# Regenerate against real traces:
+#   uv run python scripts/calibrate_reward.py --runs runs/<ab_out> --out cal.json
+
+topology:
+  paths:
+    - {rate: "8Mbps",  delay: "10ms", cross_frac: 0.45}
+    - {rate: "4Mbps",  delay: "17ms", cross_frac: 0.65}
+    - {rate: "2Mbps",  delay: "30ms", cross_frac: 0.35}
+
+video:
+  fps: 30
+  min_bitrate_kbps: 300
+  max_bitrate_kbps: 6000
+  init_bitrate_kbps: 1500
+  frame_size_jitter: 0.25
+  keyframe_interval: 30
+
+episode:
+  seconds: 30
+  app_period_s: 1.0
+  warmup_s: 1.0
+
+# ---------------------------------------------------------------------------
+# QoE reward weights — CALIBRATED vs ITU-T G.1070 (h264_bp_vga_6in oracle).
+# Standards anchors held (a=1, norms per G.114/Y.1541, §5A); c pinned = b (1:1
+# ratio, §3) since G.1070 has no jitter axis. Relative to the provisional
+# b=c=0.5, d=1.0, the fit says loss should dominate more (steep G.1070 loss
+# robustness) and delay weigh less (G.1070's delay term is weak).
+# ---------------------------------------------------------------------------
+reward:
+  a_quality: 1.0
+  b_latency: 0.25
+  c_jitter: 0.25
+  d_loss: 2.0
+  latency_norm_ms: 200.0
+  jitter_norm_ms: 50.0
+
+sac:
+  hidden_dim: 256
+  gamma: 0.99
+  tau: 0.005
+  lr: 0.0003
+  batch_size: 256
+  buffer_size: 200000
+  start_steps: 1000
+  update_after: 1000
+  updates_per_step: 1
+  auto_entropy: true
+
+run:
+  episodes: 50
+  seed: 1
+  cap_mbps: 10.0
+  out_dir: "runs"
+  path_arch: flat
